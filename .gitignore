@@ -63,5 +63,4 @@ temp/
 vouchers.txt
 
 # Compiled contracts
-*.abi.json
 *.bin
