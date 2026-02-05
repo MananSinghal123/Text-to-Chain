@@ -1,0 +1,7 @@
+/* Dashboard / overview panel */
+.dash-panel { padding: 1rem; }
+.dash-section { margin-bottom: 1.5rem; }
+.dash-section__title { font-size: 1.125rem; margin-bottom: 0.25rem; }
+.dash-section__text { color: var(--muted, #666); font-size: 0.9375rem; }
+.dash-filters { display: flex; gap: 0.75rem; margin-bottom: 1rem; flex-wrap: wrap; }
+.dash-filter__select { padding: 0.5rem 0.75rem; border-radius: 6px; border: 1px solid var(--border, #ddd); }

@@ -1,0 +1,4 @@
+/* Step card component */
+.step-card { padding: 1rem; border-radius: 8px; border: 1px solid var(--border, #eee); }
+.step-card__title { font-weight: 600; margin-bottom: 0.25rem; }
+.step-card__desc { font-size: 0.875rem; color: var(--muted, #666); }

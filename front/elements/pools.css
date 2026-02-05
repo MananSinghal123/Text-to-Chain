@@ -1,0 +1,13 @@
+/* Pools list */
+.pools-list { list-style: none; padding: 0; margin: 0; }
+.pools-list__item {
+  display: grid;
+  grid-template-columns: 1fr auto auto auto;
+  gap: 1rem;
+  align-items: center;
+  padding: 0.75rem 0;
+  border-bottom: 1px solid var(--border, #eee);
+}
+.pools-list__meta { font-weight: 500; }
+.pools-list__tvl, .pools-list__yield { font-variant-numeric: tabular-nums; }
+.pools-list__status { font-size: 0.875rem; color: var(--muted, #666); }
