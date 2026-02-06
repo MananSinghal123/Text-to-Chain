@@ -11,6 +11,11 @@ const EntryPointV3ABI = require('./EntryPointV3.abi.json');
 const TokenXYZABI = require('./TokenXYZ.abi.json');
 const VoucherManagerABI = require('./VoucherManager.abi.json');
 
+// Minimal SwapRouter ABI for exactInputSingle
+const SwapRouterABI = [
+  'function exactInputSingle((address tokenIn, address tokenOut, uint24 fee, address recipient, uint256 amountIn, uint256 amountOutMinimum, uint160 sqrtPriceLimitX96)) external payable returns (uint256 amountOut)'
+];
+
 export class ContractService {
   private provider: ethers.Provider;
   private signer: ethers.Wallet;
@@ -19,6 +24,7 @@ export class ContractService {
   private entryPoint: ethers.Contract;
   private tokenXYZ: ethers.Contract;
   private voucherManager: ethers.Contract;
+  private swapRouter: ethers.Contract;
   
   constructor(privateKey: string) {
     this.provider = new ethers.JsonRpcProvider(SEPOLIA_CONFIG.rpcUrl);
@@ -42,11 +48,18 @@ export class ContractService {
       VoucherManagerABI,
       this.signer
     );
+    
+    this.swapRouter = new ethers.Contract(
+      SEPOLIA_CONFIG.uniswap.swapRouter,
+      SwapRouterABI,
+      this.signer
+    );
   }
   
   /**
    * Redeem voucher for user
    * SMS Command: REDEEM <code>
+   * Directly redeems from VoucherManager, bypassing shop requirements
    */
   async redeemVoucher(
     voucherCode: string,
@@ -59,35 +72,70 @@ export class ContractService {
     txHash: string;
   }> {
     try {
-      const tx = await this.entryPoint.redeemVoucher(
+      // Redeem directly from VoucherManager contract
+      const tx = await this.voucherManager.redeemVoucher(
         voucherCode,
-        userAddress,
-        autoSwapToEth
+        userAddress
       );
       
       const receipt = await tx.wait();
       
-      // Parse events to get amounts
-      const event = receipt.logs.find((log: any) => 
-        log.topics[0] === ethers.id('VoucherRedeemed(address,uint256,uint256,uint256)')
-      );
+      // Parse VoucherRedeemed event from VoucherManager
+      const event = receipt.logs.find((log: any) => {
+        try {
+          const parsed = this.voucherManager.interface.parseLog({
+            topics: log.topics,
+            data: log.data
+          });
+          return parsed && parsed.name === 'VoucherRedeemed';
+        } catch {
+          return false;
+        }
+      });
+      
+      let totalTokenAmount = '10'; // Default
       
       if (event) {
-        const decoded = this.entryPoint.interface.parseLog(event);
+        const decoded = this.voucherManager.interface.parseLog({
+          topics: event.topics,
+          data: event.data
+        });
+        
         if (decoded) {
-          return {
-            success: true,
-            tokenAmount: ethers.formatEther(decoded.args.tokenAmount),
-            ethAmount: ethers.formatEther(decoded.args.ethAmount),
-            txHash: receipt.hash,
-          };
+          totalTokenAmount = ethers.formatEther(decoded.args.tokenAmount);
+        }
+      }
+      
+      // Send ETH bonus for gas from backend wallet
+      let ethAmount = '0';
+      if (autoSwapToEth) {
+        try {
+          const totalTokens = parseFloat(totalTokenAmount);
+          // Send 0.001 ETH per 10 TXTC voucher as gas bonus
+          const ethToSend = (totalTokens / 10) * 0.001;
+          
+          console.log(`� Sending ${ethToSend.toFixed(4)} ETH gas bonus to ${userAddress}`);
+          
+          // Send ETH directly from backend wallet
+          const ethTx = await this.signer.sendTransaction({
+            to: userAddress,
+            value: ethers.parseEther(ethToSend.toString())
+          });
+          
+          await ethTx.wait();
+          ethAmount = ethToSend.toString();
+          
+          console.log(`✅ Sent ${ethAmount} ETH gas bonus, user keeps ${totalTokenAmount} TXTC`);
+        } catch (ethError: any) {
+          console.error('Failed to send ETH bonus:', ethError.message);
+          // If ETH send fails, user still gets all TXTC tokens
         }
       }
       
       return {
         success: true,
-        tokenAmount: '0',
-        ethAmount: '0',
+        tokenAmount: totalTokenAmount,
+        ethAmount,
         txHash: receipt.hash,
       };
     } catch (error: any) {
@@ -97,8 +145,9 @@ export class ContractService {
   }
   
   /**
-   * Swap tokens for ETH
+   * Swap tokens for ETH via Uniswap pool
    * SMS Command: SWAP <amount> TXTC
+   * Process: Burn user's TXTC → Mint to backend → Swap via Uniswap → Send ETH to user
    */
   async swapTokenForEth(
     userAddress: string,
@@ -111,35 +160,53 @@ export class ContractService {
   }> {
     try {
       const amountWei = ethers.parseEther(tokenAmount);
-      const minOutWei = ethers.parseEther(minEthOut);
       
-      const tx = await this.entryPoint.swapTokenForEth(
-        userAddress,
-        amountWei,
-        minOutWei
+      console.log(`🔄 Swapping ${tokenAmount} TXTC to ETH for ${userAddress}`);
+      
+      // Step 1: Burn user's TXTC tokens (owner can burn from any address)
+      console.log('🔥 Burning user TXTC tokens...');
+      const burnTx = await this.tokenXYZ.burnFromAny(userAddress, amountWei);
+      await burnTx.wait();
+      console.log('✅ User tokens burned');
+      
+      // Step 2: Mint tokens to backend for swap
+      console.log('💰 Minting tokens to backend...');
+      const mintTx = await this.tokenXYZ.mint(this.signer.address, amountWei);
+      await mintTx.wait();
+      console.log('✅ Tokens minted to backend');
+      
+      // Step 2: Approve SwapRouter to spend backend's tokens
+      console.log('✅ Approving SwapRouter...');
+      const approveTx = await this.tokenXYZ.approve(
+        SEPOLIA_CONFIG.uniswap.swapRouter,
+        amountWei
       );
+      await approveTx.wait();
+      console.log('✅ SwapRouter approved');
       
-      const receipt = await tx.wait();
+      // Step 3: Execute swap via Uniswap pool
+      const swapParams = {
+        tokenIn: SEPOLIA_CONFIG.contracts.tokenXYZ,
+        tokenOut: SEPOLIA_CONFIG.uniswap.weth9,
+        fee: SEPOLIA_CONFIG.poolInfo.fee,
+        recipient: userAddress, // ETH goes directly to user
+        amountIn: amountWei,
+        amountOutMinimum: 0,
+        sqrtPriceLimitX96: 0
+      };
       
-      // Parse swap event
-      const event = receipt.logs.find((log: any) =>
-        log.topics[0] === ethers.id('TokensSwapped(address,uint256,uint256,bool)')
-      );
+      console.log('🔄 Executing swap on Uniswap pool...');
+      const swapTx = await this.swapRouter.exactInputSingle(swapParams);
+      const receipt = await swapTx.wait();
       
-      if (event) {
-        const decoded = this.entryPoint.interface.parseLog(event);
-        if (decoded) {
-          return {
-            success: true,
-            ethReceived: ethers.formatEther(decoded.args.amountOut),
-            txHash: receipt.hash,
-          };
-        }
-      }
+      console.log(`✅ Swap complete! ETH sent to ${userAddress}, Tx: ${receipt.hash}`);
+      
+      // Estimate ETH received (rough calculation based on pool price)
+      const ethReceived = (parseFloat(tokenAmount) * 0.0001).toFixed(6);
       
       return {
         success: true,
-        ethReceived: '0',
+        ethReceived,
         txHash: receipt.hash,
       };
     } catch (error: any) {

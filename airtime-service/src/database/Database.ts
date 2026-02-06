@@ -19,6 +19,7 @@ export class AirtimeDatabase {
         phone_number TEXT UNIQUE NOT NULL,
         wallet_address TEXT NOT NULL,
         encrypted_private_key TEXT NOT NULL,
+        ens_name TEXT,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         last_active DATETIME DEFAULT CURRENT_TIMESTAMP
       );
@@ -63,6 +64,7 @@ export class AirtimeDatabase {
       phoneNumber: row.phone_number,
       walletAddress: row.wallet_address,
       encryptedPrivateKey: row.encrypted_private_key,
+      ensName: row.ens_name || undefined,
       createdAt: new Date(row.created_at),
       lastActive: new Date(row.last_active),
     };
@@ -91,6 +93,17 @@ export class AirtimeDatabase {
   updateUserActivity(phoneNumber: string): void {
     const stmt = this.db.prepare('UPDATE users SET last_active = CURRENT_TIMESTAMP WHERE phone_number = ?');
     stmt.run(phoneNumber);
+  }
+  
+  updateUserEnsName(phoneNumber: string, ensName: string): void {
+    const stmt = this.db.prepare('UPDATE users SET ens_name = ? WHERE phone_number = ?');
+    stmt.run(ensName, phoneNumber);
+  }
+  
+  isEnsNameTaken(ensName: string): boolean {
+    const stmt = this.db.prepare('SELECT COUNT(*) as count FROM users WHERE ens_name = ?');
+    const result = stmt.get(ensName) as any;
+    return result.count > 0;
   }
   
   decryptPrivateKey(encryptedKey: string): string {

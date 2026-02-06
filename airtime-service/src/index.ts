@@ -4,6 +4,7 @@ import helmet from 'helmet';
 import morgan from 'morgan';
 import dotenv from 'dotenv';
 import routes from './api/routes';
+import ensRoutes from './api/ens-routes';
 import { TelcoFactory } from './telco/TelcoFactory';
 
 // Load environment variables
@@ -36,6 +37,7 @@ app.get('/health', (req, res) => {
 
 // API routes
 app.use('/api', routes);
+app.use('/api/ens', ensRoutes);
 
 // Error handler
 app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
@@ -62,6 +64,7 @@ app.listen(PORT, () => {
    GET    /api/transactions/:phoneNumber
    POST   /api/webhooks/payment
    POST   /api/ussd/callback
+   POST   /api/ens/register
 
 🔧 Telco operators initialized
 ✅ Server ready!

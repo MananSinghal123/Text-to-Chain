@@ -1,4 +1,5 @@
 mod admin;
+mod admin_wallet;
 mod commands;
 mod config;
 mod db;
@@ -72,7 +73,7 @@ async fn main() -> anyhow::Result<()> {
         );
 
         tracing::info!("Admin routes enabled at /admin/*");
-        create_router_with_admin(twilio, command_processor, voucher_repo, admin_token)
+        create_router_with_admin(twilio, command_processor, voucher_repo, admin_token, pool.clone())
     } else {
         let command_processor = CommandProcessor::new(
             None, 

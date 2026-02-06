@@ -7,7 +7,7 @@ SMS Airtime to TXTC Token Conversion Service - Convert mobile airtime to blockch
 - ✅ Buy TXTC tokens with mobile airtime (MTN, Airtel)
 - ✅ Automatic 90% TXTC + 10% ETH distribution
 - ✅ SMS command interface
-- ✅ USSD menu interface (*384*1234#)
+- ✅ USSD menu interface (*384*46750#)
 - ✅ Automatic wallet creation
 - ✅ Transaction history
 - ✅ Multi-operator support
@@ -114,7 +114,7 @@ Users can send SMS to your shortcode:
 
 ## USSD Menu
 
-Users dial `*384*1234#`:
+Users dial `*384*46750#`:
 
 ```
 Welcome to TXTC
@@ -122,6 +122,11 @@ Welcome to TXTC
 2. Check Balance
 3. Transaction History
 ```
+
+**Testing USSD:**
+- Dial `*384*46750#` from any phone in Africa's Talking supported countries
+- Follow the interactive menu
+- Transactions are processed via Africa's Talking payment gateway
 
 ## Architecture
 

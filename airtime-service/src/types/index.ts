@@ -74,6 +74,7 @@ export interface User {
   phoneNumber: string;
   walletAddress: string;
   encryptedPrivateKey: string;
+  ensName?: string;
   createdAt: Date;
   lastActive: Date;
 }

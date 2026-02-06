@@ -9,6 +9,7 @@ pub struct User {
     pub wallet_address: String,
     pub encrypted_private_key: String,
     pub pin_hash: Option<String>,
+    pub ens_name: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -26,7 +27,7 @@ impl UserRepository {
     /// Find user by phone number
     pub async fn find_by_phone(&self, phone: &str) -> Result<Option<User>, sqlx::Error> {
         sqlx::query_as::<_, User>(
-            "SELECT id, phone, wallet_address, encrypted_private_key, pin_hash, created_at 
+            "SELECT id, phone, wallet_address, encrypted_private_key, pin_hash, ens_name, created_at 
              FROM users WHERE phone = $1"
         )
         .bind(phone)
@@ -47,7 +48,7 @@ impl UserRepository {
             r#"
             INSERT INTO users (id, phone, wallet_address, encrypted_private_key)
             VALUES ($1, $2, $3, $4)
-            RETURNING id, phone, wallet_address, encrypted_private_key, pin_hash, created_at
+            RETURNING id, phone, wallet_address, encrypted_private_key, pin_hash, ens_name, created_at
             "#
         )
         .bind(id)
@@ -62,6 +63,16 @@ impl UserRepository {
     pub async fn update_pin(&self, phone: &str, pin_hash: &str) -> Result<(), sqlx::Error> {
         sqlx::query("UPDATE users SET pin_hash = $1 WHERE phone = $2")
             .bind(pin_hash)
+            .bind(phone)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Update user's ENS name
+    pub async fn update_ens_name(&self, phone: &str, ens_name: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE users SET ens_name = $1 WHERE phone = $2")
+            .bind(ens_name)
             .bind(phone)
             .execute(&self.pool)
             .await?;

@@ -30,6 +30,7 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
             wallet_address VARCHAR(42) NOT NULL,
             encrypted_private_key TEXT NOT NULL,
             pin_hash VARCHAR(255),
+            ens_name VARCHAR(255),
             preferred_chain VARCHAR(20) DEFAULT 'polygon-amoy',
             created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
         )",

@@ -8,8 +8,8 @@ use crate::wallet::{AmoyProvider, UserWallet, Chain, MultiChainProvider};
 pub enum Command {
     /// Show help/available commands
     Help,
-    /// Register a new user
-    Join,
+    /// Register a new user with optional ENS name
+    Join { ens_name: Option<String> },
     /// Check account balance
     Balance,
     /// Set or change PIN
@@ -26,8 +26,15 @@ pub enum Command {
     History,
     /// Redeem a voucher code
     Redeem { code: String },
-    /// Swap tokens for ETH
+    /// Swap tokens for ETH: SWAP <amount> TXTC
     Swap { amount: f64, token: String },
+    /// Bridge tokens cross-chain: BRIDGE <amount> <token> FROM <chain> TO <chain>
+    Bridge {
+        amount: f64,
+        token: String,
+        from_chain: String,
+        to_chain: String,
+    },
     /// Save a contact: SAVE <name> <phone>
     Save { name: String, phone: String },
     /// List contacts
@@ -94,8 +101,10 @@ impl CommandProcessor {
 
     /// Parse SMS text into a structured command
     pub fn parse(&self, text: &str) -> Command {
-        let text = text.trim().to_uppercase();
+        let original = text.trim();
+        let text = original.to_uppercase();
         let parts: Vec<&str> = text.split_whitespace().collect();
+        let original_parts: Vec<&str> = original.split_whitespace().collect();
 
         if parts.is_empty() {
             return Command::Unknown("".to_string());
@@ -103,13 +112,16 @@ impl CommandProcessor {
 
         match parts[0] {
             "HELP" | "?" | "COMMANDS" => Command::Help,
-            "JOIN" | "START" | "REGISTER" => Command::Join,
+            "JOIN" | "START" | "REGISTER" => {
+                let ens_name = parts.get(1).map(|s| s.to_lowercase());
+                Command::Join { ens_name }
+            },
             "BALANCE" | "BAL" => Command::Balance,
             "PIN" => {
                 let new_pin = parts.get(1).map(|s| s.to_string());
                 Command::Pin { new_pin }
             }
-            "SEND" => self.parse_send(&parts),
+            "SEND" => self.parse_send(&original_parts),
             "DEPOSIT" | "RECEIVE" => Command::Deposit,
             "HISTORY" | "TRANSACTIONS" | "TXS" => Command::History,
             "REDEEM" | "VOUCHER" | "CODE" => {
@@ -119,7 +131,8 @@ impl CommandProcessor {
                     Command::Redeem { code: parts[1].to_string() }
                 }
             }
-            "SWAP" | "CONVERT" => self.parse_swap(&parts),
+            "SWAP" | "EXCHANGE" => self.parse_swap(&parts),
+            "BRIDGE" | "CROSS" => self.parse_bridge(&parts),
             "SAVE" | "ADD" => self.parse_save(&parts),
             "CONTACTS" | "BOOK" => Command::Contacts,
             "CHAIN" | "NETWORK" => {
@@ -133,22 +146,6 @@ impl CommandProcessor {
         }
     }
 
-    /// Parse SWAP command: SWAP <amount> <token>
-    fn parse_swap(&self, parts: &[&str]) -> Command {
-        if parts.len() < 3 {
-            return Command::Unknown("Usage: SWAP <amount> <token>\nExample: SWAP 100 TXTC".to_string());
-        }
-
-        let amount = match parts[1].parse::<f64>() {
-            Ok(amt) => amt,
-            Err(_) => return Command::Unknown("Invalid amount".to_string()),
-        };
-
-        let token = parts[2].to_string();
-        
-        Command::Swap { amount, token }
-    }
-
     /// Parse SAVE command: SAVE <name> <phone>
     fn parse_save(&self, parts: &[&str]) -> Command {
         if parts.len() < 3 {
@@ -160,10 +157,79 @@ impl CommandProcessor {
         }
     }
 
-    /// Parse SEND command: SEND <amount> <token> TO <recipient>
+    /// Parse SEND command: SEND <amount> <token> [TO] <recipient>
+    /// Supports: SEND 10 TXTC TO swarnim.ttcip.eth
+    ///           SEND 10 TXTC swarnim.ttcip.eth
+    ///           SEND 0.001 ETH 0xabc...
     fn parse_send(&self, parts: &[&str]) -> Command {
+        if parts.len() < 4 {
+            return Command::Unknown("Use: SEND <amount> <token> <recipient>\nExample: SEND 10 TXTC swarnim.ttcip.eth".to_string());
+        }
+
+        let amount = match parts[1].parse::<f64>() {
+            Ok(amt) => amt,
+            Err(_) => return Command::Unknown("Invalid amount".to_string()),
+        };
+
+        let token = parts[2].to_string();
+
+        // Check if "TO" keyword is present (optional)
+        let recipient = if parts.len() >= 5 && parts[3].eq_ignore_ascii_case("TO") {
+            parts[4..].join(" ")
+        } else {
+            parts[3..].join(" ")
+        };
+
+        if recipient.is_empty() {
+            return Command::Unknown("Missing recipient.\nExample: SEND 10 TXTC swarnim.ttcip.eth".to_string());
+        }
+
+        Command::Send {
+            amount,
+            token,
+            recipient,
+        }
+    }
+
+    /// Parse BRIDGE command: BRIDGE <amount> <token> FROM <chain> TO <chain>
+    /// Also supports: BRIDGE <amount> <token> <from_chain> <to_chain>
+    fn parse_bridge(&self, parts: &[&str]) -> Command {
         if parts.len() < 5 {
-            return Command::Unknown("Invalid SEND format. Use: SEND <amount> <token> TO <phone>".to_string());
+            return Command::Unknown("Usage: BRIDGE <amount> <token> FROM <chain> TO <chain>\nExample: BRIDGE 10 USDC FROM POLYGON TO BASE".to_string());
+        }
+
+        let amount = match parts[1].parse::<f64>() {
+            Ok(amt) => amt,
+            Err(_) => return Command::Unknown("Invalid amount".to_string()),
+        };
+
+        let token = parts[2].to_string();
+
+        // Parse FROM/TO chains - support both "FROM x TO y" and "x y" formats
+        let (from_chain, to_chain) = if parts.len() >= 7 && parts[3] == "FROM" && parts[5] == "TO" {
+            (parts[4].to_string(), parts[6].to_string())
+        } else if parts.len() >= 6 && parts[3] == "FROM" {
+            // BRIDGE 10 USDC FROM POLYGON BASE
+            (parts[4].to_string(), parts[5].to_string())
+        } else if parts.len() >= 5 {
+            // BRIDGE 10 USDC POLYGON BASE
+            (parts[3].to_string(), parts[4].to_string())
+        } else {
+            return Command::Unknown("Usage: BRIDGE <amount> <token> FROM <chain> TO <chain>".to_string());
+        };
+
+        Command::Bridge {
+            amount,
+            token,
+            from_chain,
+            to_chain,
+        }
+    }
+
+    /// Parse SWAP command: SWAP <amount> TXTC
+    fn parse_swap(&self, parts: &[&str]) -> Command {
+        if parts.len() < 3 {
+            return Command::Unknown("Usage: SWAP <amount> TXTC".to_string());
         }
 
         let amount = match parts[1].parse::<f64>() {
@@ -173,17 +239,9 @@ impl CommandProcessor {
 
         let token = parts[2].to_string();
         
-        let to_index = parts.iter().position(|&p| p == "TO");
-        if to_index.is_none() || to_index.unwrap() + 1 >= parts.len() {
-            return Command::Unknown("Missing recipient. Use: SEND <amount> <token> TO <phone>".to_string());
-        }
-
-        let recipient = parts[to_index.unwrap() + 1..].join(" ");
-
-        Command::Send {
+        Command::Swap {
             amount,
             token,
-            recipient,
         }
     }
 
@@ -191,7 +249,7 @@ impl CommandProcessor {
     async fn execute(&self, from: &str, command: Command) -> String {
         match command {
             Command::Help => self.help_response(),
-            Command::Join => self.join_response(from).await,
+            Command::Join { ens_name } => self.join_response(from, ens_name).await,
             Command::Balance => self.balance_response(from).await,
             Command::Pin { new_pin } => self.pin_response(from, new_pin).await,
             Command::Send { amount, token, recipient } => {
@@ -201,6 +259,9 @@ impl CommandProcessor {
             Command::History => self.history_response(from).await,
             Command::Redeem { code } => self.redeem_response(from, &code).await,
             Command::Swap { amount, token } => self.swap_response(from, amount, &token).await,
+            Command::Bridge { amount, token, from_chain, to_chain } => {
+                self.bridge_response(from, amount, &token, &from_chain, &to_chain).await
+            }
             Command::Save { name, phone } => self.save_response(from, &name, &phone).await,
             Command::Contacts => self.contacts_response(from).await,
             Command::SwitchChain { chain } => self.chain_response(from, &chain).await,
@@ -212,62 +273,141 @@ impl CommandProcessor {
         "TextChain Commands:\n\
          JOIN - Create wallet\n\
          BALANCE - Check balance\n\
-         SEND <amt> <token> TO <phone> - Send tokens\n\
-         SWAP <amt> <token> - Swap tokens for ETH\n\
-         REDEEM <code> - Redeem voucher\n\
-         DEPOSIT - Get deposit address\n\
-         HISTORY - Recent transactions\n\
-         SAVE <name> <phone> - Save contact\n\
-         CONTACTS - List contacts\n\
-         CHAIN <name> - Switch network\n\
-         PIN <code> - Set PIN".to_string()
+         REDEEM <code> - Use voucher\n\
+         DEPOSIT - Get address\n\
+         SEND 10 TXTC TO alice.ttcip.eth\n\
+         SWAP 10 TXTC - Swap for ETH\n\
+         BRIDGE 10 USDC FROM POLYGON TO BASE\n\
+         SAVE <name> <phone>\n\
+         CONTACTS - List saved\n\
+         CHAIN <polygon|base|arb|op>\n\
+         HELP - This message".to_string()
     }
 
-    async fn join_response(&self, from: &str) -> String {
+    async fn join_response(&self, from: &str, ens_name: Option<String>) -> String {
         // Check if database is available
         let Some(ref repo) = self.user_repo else {
             return "DB offline. Try later.".to_string();
         };
 
-        // Check if user already exists
-        match repo.find_by_phone(from).await {
-            Ok(Some(user)) => {
-                return format!(
-                    "Welcome back!\n\nYour wallet:\n{}...{}\n\nReply BALANCE or DEPOSIT",
-                    &user.wallet_address[..6],
-                    &user.wallet_address[user.wallet_address.len() - 4..]
-                );
+        // If ENS name provided, validate and register it
+        if let Some(name) = ens_name {
+            // Validate format
+            if name.len() < 3 || name.len() > 20 {
+                return "ENS name must be 3-20 characters.\n\nTry again: JOIN <name>\nExample: JOIN alice".to_string();
             }
-            Ok(None) => {}
-            Err(e) => {
-                tracing::error!("DB error: {}", e);
-                return "Error. Try later.".to_string();
+            if !name.chars().all(|c| c.is_alphanumeric()) {
+                return "ENS name can only contain letters and numbers.\n\nTry again: JOIN <name>".to_string();
+            }
+
+            // Check if user already has a wallet
+            match repo.find_by_phone(from).await {
+                Ok(Some(user)) => {
+                    // User exists, register ENS name
+                    let client = reqwest::Client::new();
+                    
+                    // Check if name is available
+                    let check_result = client
+                        .get(&format!("http://localhost:3000/api/ens/check/{}", name))
+                        .send()
+                        .await;
+
+                    match check_result {
+                        Ok(resp) if resp.status().is_success() => {
+                            if let Ok(check_data) = resp.json::<serde_json::Value>().await {
+                                if !check_data["available"].as_bool().unwrap_or(false) {
+                                    let reason = check_data["reason"].as_str().unwrap_or("Name not available");
+                                    return format!(
+                                        "❌ {}\n\nTry another name:\nJOIN <name>\n\nExamples: alice, bob123, john",
+                                        reason
+                                    );
+                                }
+                            }
+                        }
+                        _ => {
+                            return "Error checking name availability. Try later.".to_string();
+                        }
+                    }
+
+                    // Name is available, register it
+                    let full_ens = format!("{}.ttcip.eth", name);
+                    let register_result = client
+                        .post("http://localhost:3000/api/ens/register")
+                        .json(&serde_json::json!({
+                            "ensName": name,
+                            "walletAddress": user.wallet_address
+                        }))
+                        .send()
+                        .await;
+
+                    match register_result {
+                        Ok(resp) if resp.status().is_success() => {
+                            // Save ENS name to database
+                            let full_ens = format!("{}.ttcip.eth", name);
+                            if let Err(e) = repo.update_ens_name(from, &full_ens).await {
+                                tracing::error!("Failed to save ENS name to database: {}", e);
+                            }
+                            
+                            // TODO: Mint ENS subdomain on-chain here
+                            return format!(
+                                "✅ ENS name registered!\n\n{}\n→ {}\n\nFund your wallet:\n• AIRTIME: Dial *384*46750#\n• REDEEM: Reply REDEEM <code>\n• DEPOSIT: Reply DEPOSIT",
+                                full_ens,
+                                user.wallet_address
+                            );
+                        }
+                        _ => {
+                            return "Error registering ENS name. Try later.".to_string();
+                        }
+                    }
+                }
+                Ok(None) => {
+                    return "Please use JOIN first to create your wallet.".to_string();
+                }
+                Err(_) => {
+                    return "Error. Try later.".to_string();
+                }
             }
         }
 
-        // Create new wallet
-        let wallet = match UserWallet::create_new() {
-            Ok(w) => w,
-            Err(e) => {
-                tracing::error!("Wallet error: {}", e);
-                return "Error creating wallet.".to_string();
+        // No ENS name provided - check if user already exists
+        match repo.find_by_phone(from).await {
+            Ok(Some(user)) => {
+                // User already has wallet, just show welcome message
+                return format!(
+                    "Welcome back!\n\nYour wallet:\n{}\n\nReply BALANCE or DEPOSIT",
+                    user.wallet_address
+                );
             }
-        };
+            Ok(None) => {
+                // New user - create wallet and prompt for ENS name
+                let wallet = match UserWallet::create_new() {
+                    Ok(w) => w,
+                    Err(e) => {
+                        tracing::error!("Wallet error: {}", e);
+                        return "Error creating wallet.".to_string();
+                    }
+                };
 
-        // Encrypt private key (simple hex for now - TODO: proper encryption)
-        let encrypted_key = hex::encode(wallet.private_key_bytes());
+                // Encrypt private key
+                let encrypted_key = hex::encode(wallet.private_key_bytes());
 
-        // Save to database
-        match repo.create(from, &wallet.address_string(), &encrypted_key).await {
-            Ok(_) => {
-                format!(
-                    "Wallet created!\n\n{}\n\nReply DEPOSIT to fund it.",
-                    wallet.address_string()
-                )
+                // Save to database
+                match repo.create(from, &wallet.address_string(), &encrypted_key).await {
+                    Ok(_) => {
+                        format!(
+                            "✓ Wallet created!\n\n{}\n\nNow choose your ENS name:\nJOIN <name>\n\nExamples:\n• JOIN alice\n• JOIN bob123\n• JOIN john\n\nYour name will be: <name>.ttcip.eth",
+                            wallet.address_string()
+                        )
+                    }
+                    Err(e) => {
+                        tracing::error!("DB save error: {}", e);
+                        "Error saving wallet.".to_string()
+                    }
+                }
             }
             Err(e) => {
-                tracing::error!("DB save error: {}", e);
-                "Error saving wallet.".to_string()
+                tracing::error!("DB error: {}", e);
+                "Error. Try later.".to_string()
             }
         }
     }
@@ -350,9 +490,10 @@ impl CommandProcessor {
     }
 
     async fn send_response(&self, from: &str, amount: f64, token: &str, recipient: &str) -> String {
-        // Only support TXTC for now
-        if token.to_uppercase() != "TXTC" {
-            return format!("Only TXTC transfers supported.\nYou have: {} TXTC", token);
+        let token_upper = token.to_uppercase();
+        // Support TXTC and ETH
+        if token_upper != "TXTC" && token_upper != "ETH" {
+            return format!("Supported tokens: TXTC, ETH\nExample: SEND 10 TXTC swarnim.ttcip.eth");
         }
 
         // Get sender's wallet and private key
@@ -362,11 +503,11 @@ impl CommandProcessor {
 
         let sender = match user_repo.find_by_phone(from).await {
             Ok(Some(u)) => u,
-            Ok(None) => return "No wallet. Reply JOIN first.".to_string(),
-            Err(_) => return "Error. Try later.".to_string(),
+            Ok(None) => { return "No wallet. Reply JOIN first.".to_string(); },
+            Err(_) => { return "Error. Try later.".to_string(); },
         };
 
-        // Resolve recipient address (could be phone number or wallet address)
+        // Resolve recipient address (wallet address, phone number, or ENS name)
         let recipient_address = if recipient.starts_with("0x") && recipient.len() == 42 {
             // Already a wallet address
             recipient.to_string()
@@ -374,35 +515,74 @@ impl CommandProcessor {
             // Phone number - look up in database
             match user_repo.find_by_phone(recipient).await {
                 Ok(Some(u)) => u.wallet_address,
-                Ok(None) => return format!("{} hasn't joined yet.\nAsk them to text JOIN", recipient),
-                Err(_) => return "Error looking up recipient.".to_string(),
+                Ok(None) => { return format!("{} hasn't joined yet.\nAsk them to text JOIN", recipient); },
+                Err(_) => { return "Error looking up recipient.".to_string(); },
+            }
+        } else if recipient.contains(".eth") || recipient.contains(".") {
+            // ENS name (e.g., swarnim.ttcip.eth) - resolve via backend
+            let client = reqwest::Client::new();
+            let resolve_url = format!("http://localhost:3000/api/ens/resolve/{}", recipient);
+            match client.get(&resolve_url).send().await {
+                Ok(resp) => {
+                    match resp.json::<serde_json::Value>().await {
+                        Ok(json) => {
+                            if let Some(addr) = json["address"].as_str() {
+                                addr.to_string()
+                            } else {
+                                return format!("Could not resolve {}.\nUse wallet address instead.", recipient);
+                            }
+                        },
+                        Err(_) => { return format!("Could not resolve {}.", recipient); },
+                    }
+                },
+                Err(_) => { return "Network error resolving ENS. Try later.".to_string(); },
             }
         } else {
-            return "Invalid recipient.\nUse phone (+1...) or address (0x...)".to_string();
+            // Try as contact name from address book
+            if let Some(ref address_book) = self.address_book_repo {
+                match address_book.find_by_name(from, recipient).await {
+                    Ok(contacts) if !contacts.is_empty() => {
+                        let contact = &contacts[0];
+                        if let Some(ref addr) = contact.wallet_address {
+                            addr.clone()
+                        } else if let Some(ref phone) = contact.contact_phone {
+                            match user_repo.find_by_phone(phone).await {
+                                Ok(Some(u)) => u.wallet_address,
+                                _ => { return format!("Contact {} has no wallet.", recipient); },
+                            }
+                        } else {
+                            return format!("Contact {} has no address.", recipient);
+                        }
+                    },
+                    _ => { return "Invalid recipient.\nUse ENS (name.ttcip.eth), phone (+1...), or address (0x...)".to_string(); },
+                }
+            } else {
+                return "Invalid recipient.\nUse ENS (name.ttcip.eth), phone (+1...), or address (0x...)".to_string();
+            }
         };
 
-        // Get user's private key (stored as hex without 0x prefix)
-        let private_key = format!("0x{}", sender.encrypted_private_key);
-
-        // Call Contract API to send tokens
+        // Route through Yellow Network for instant finality
         let client = reqwest::Client::new();
-        let api_url = "http://localhost:3000/api/send";
+        let api_url = "http://localhost:3000/api/send-yellow";
         
-        tracing::info!("Sending {} TXTC from {} to {}", amount, sender.wallet_address, recipient_address);
+        tracing::info!("Sending {} {} from {} to {} (via Yellow)", amount, token_upper, sender.wallet_address, recipient_address);
         
         let response = match client
             .post(api_url)
             .json(&serde_json::json!({
-                "userPrivateKey": private_key,
+                "fromAddress": sender.wallet_address,
                 "toAddress": recipient_address,
-                "amount": amount.to_string()
+                "amount": amount.to_string(),
+                "token": token_upper,
+                "userPhone": from
             }))
+            .timeout(std::time::Duration::from_secs(5))
             .send()
             .await
         {
             Ok(resp) => resp,
             Err(e) => {
-                tracing::error!("Failed to call Contract API: {}", e);
+                tracing::error!("Failed to call Yellow API: {}", e);
                 return "Network error. Try later.".to_string();
             }
         };
@@ -417,13 +597,9 @@ impl CommandProcessor {
         };
 
         if result["success"].as_bool().unwrap_or(false) {
-            let tx_hash = result["txHash"].as_str().unwrap_or("");
-            
-            tracing::info!("Transfer successful: tx {}", tx_hash);
-            
             format!(
-                "Sent {} TXTC to {}!\n\nReply BALANCE to check.",
-                amount, recipient
+                "Sending {} {} to {}...\n\nQueued via Yellow Network.\nYou'll get SMS when complete.",
+                amount, token_upper, recipient
             )
         } else {
             let error_msg = result["error"].as_str().unwrap_or("Unknown error");
@@ -437,82 +613,6 @@ impl CommandProcessor {
         }
     }
 
-    async fn swap_response(&self, from: &str, amount: f64, token: &str) -> String {
-        // Only support TXTC for now
-        if token.to_uppercase() != "TXTC" {
-            return format!("Only TXTC swaps supported.\nYou have: {} TXTC", token);
-        }
-
-        // Get user's wallet and private key
-        let Some(ref user_repo) = self.user_repo else {
-            return "DB offline. Try later.".to_string();
-        };
-
-        let user = match user_repo.find_by_phone(from).await {
-            Ok(Some(u)) => u,
-            Ok(None) => return "No wallet. Reply JOIN first.".to_string(),
-            Err(_) => return "Error. Try later.".to_string(),
-        };
-
-        // Get user's private key (stored as hex without 0x prefix)
-        let private_key = format!("0x{}", user.encrypted_private_key);
-
-        // Call Contract API to swap tokens
-        let client = reqwest::Client::new();
-        let api_url = "http://localhost:3000/api/swap";
-        
-        tracing::info!("Swapping {} TXTC to ETH for {}", amount, user.wallet_address);
-        
-        let response = match client
-            .post(api_url)
-            .json(&serde_json::json!({
-                "userPrivateKey": private_key,
-                "tokenAmount": amount.to_string(),
-                "minEthOut": "0"
-            }))
-            .send()
-            .await
-        {
-            Ok(resp) => resp,
-            Err(e) => {
-                tracing::error!("Failed to call Contract API: {}", e);
-                return "Network error. Try later.".to_string();
-            }
-        };
-
-        // Parse response
-        let result: serde_json::Value = match response.json().await {
-            Ok(json) => json,
-            Err(e) => {
-                tracing::error!("Failed to parse API response: {}", e);
-                return "Error processing response.".to_string();
-            }
-        };
-
-        if result["success"].as_bool().unwrap_or(false) {
-            let eth_received = result["ethReceived"].as_str().unwrap_or("0");
-            let tx_hash = result["txHash"].as_str().unwrap_or("");
-            
-            tracing::info!("Swap successful: {} ETH received, tx {}", eth_received, tx_hash);
-            
-            format!(
-                "Swapped {} TXTC for {} ETH!\n\nReply BALANCE to check.",
-                amount, eth_received
-            )
-        } else {
-            let error_msg = result["error"].as_str().unwrap_or("Unknown error");
-            tracing::error!("Swap failed: {}", error_msg);
-            
-            if error_msg.contains("insufficient") || error_msg.contains("balance") {
-                "Insufficient balance.".to_string()
-            } else if error_msg.contains("slippage") {
-                "Price moved too much. Try again.".to_string()
-            } else {
-                "Swap failed. Try later.".to_string()
-            }
-        }
-    }
-
     async fn deposit_response(&self, from: &str) -> String {
         let Some(ref repo) = self.user_repo else {
             return "DB offline. Reply JOIN first.".to_string();
@@ -520,9 +620,15 @@ impl CommandProcessor {
 
         match repo.find_by_phone(from).await {
             Ok(Some(user)) => {
+                let deposit_address = if let Some(ref ens) = user.ens_name {
+                    ens.clone()
+                } else {
+                    user.wallet_address.clone()
+                };
+                
                 format!(
-                    "Deposit MATIC to:\n{}\n\nPolygon Amoy testnet",
-                    user.wallet_address
+                    "💰 Fund your wallet:\n\n1️⃣ AIRTIME (USSD)\nDial *384*46750#\n\n2️⃣ VOUCHER\nREDEEM <code>\n\n3️⃣ EXTERNAL WALLET\nDeposit to:\n{}",
+                    deposit_address
                 )
             }
             Ok(None) => "No wallet. Reply JOIN first.".to_string(),
@@ -568,7 +674,8 @@ impl CommandProcessor {
             .post(api_url)
             .json(&serde_json::json!({
                 "voucherCode": code,
-                "userAddress": user.wallet_address
+                "userAddress": user.wallet_address,
+                "userPhone": from
             }))
             .send()
             .await
@@ -609,6 +716,103 @@ impl CommandProcessor {
                 "Invalid voucher code.".to_string()
             } else {
                 "Redemption failed. Try later.".to_string()
+            }
+        }
+    }
+
+    async fn swap_response(&self, from: &str, amount: f64, token: &str) -> String {
+        // Check if user has wallet
+        let Some(ref user_repo) = self.user_repo else {
+            return "DB offline. Try later.".to_string();
+        };
+
+        // Get user's wallet address
+        let user = match user_repo.find_by_phone(from).await {
+            Ok(Some(user)) => user,
+            Ok(None) => { return "No wallet. Reply JOIN first.".to_string(); },
+            Err(_) => { return "Error. Try later.".to_string(); },
+        };
+
+        // Call Contract API to swap tokens (async - don't wait for completion)
+        let client = reqwest::Client::new();
+        let api_url = "http://localhost:3000/api/swap";
+        
+        tracing::info!("Initiating swap of {} {} for user {}", amount, token, user.wallet_address);
+        
+        // Send request with user phone for SMS notification
+        let _response = client
+            .post(api_url)
+            .json(&serde_json::json!({
+                "userAddress": user.wallet_address,
+                "tokenAmount": amount.to_string(),
+                "minEthOut": "0",
+                "userPhone": from
+            }))
+            .timeout(std::time::Duration::from_secs(2))
+            .send()
+            .await;
+
+        // Respond immediately - don't wait for swap to complete
+        // Backend will send SMS notification when swap completes
+        format!(
+            "Swapping {} {}...\n\nYou'll get an SMS when complete.\n\nThis may take 30 seconds.",
+            amount, token
+        )
+    }
+
+    async fn bridge_response(&self, from: &str, amount: f64, token: &str, from_chain: &str, to_chain: &str) -> String {
+        let Some(ref user_repo) = self.user_repo else {
+            return "DB offline. Try later.".to_string();
+        };
+
+        let user = match user_repo.find_by_phone(from).await {
+            Ok(Some(user)) => user,
+            Ok(None) => return "No wallet. Reply JOIN first.".to_string(),
+            Err(_) => return "Error. Try later.".to_string(),
+        };
+
+        let client = reqwest::Client::new();
+
+        tracing::info!(
+            "Bridge: {} {} from {} to {} for {}",
+            amount, token, from_chain, to_chain, user.wallet_address
+        );
+
+        let response = client
+            .post("http://localhost:3000/api/bridge")
+            .json(&serde_json::json!({
+                "fromChain": from_chain.to_lowercase(),
+                "toChain": to_chain.to_lowercase(),
+                "fromToken": token,
+                "toToken": token,
+                "amount": amount.to_string(),
+                "userAddress": user.wallet_address,
+                "userPhone": from
+            }))
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await;
+
+        match response {
+            Ok(resp) => {
+                if let Ok(result) = resp.json::<serde_json::Value>().await {
+                    if result["success"].as_bool().unwrap_or(false) {
+                        let route = result["route"].as_str().unwrap_or("");
+                        format!(
+                            "🌉 Bridge initiated!\n\n{}\n\nYou'll get an SMS when complete.\nThis may take a few minutes.",
+                            route
+                        )
+                    } else {
+                        let err = result["error"].as_str().unwrap_or("Unknown error");
+                        format!("❌ Bridge failed: {}", err)
+                    }
+                } else {
+                    "Bridge initiated. You'll get an SMS when complete.".to_string()
+                }
+            }
+            Err(e) => {
+                tracing::error!("Bridge API error: {}", e);
+                "Bridge service unavailable. Try later.".to_string()
             }
         }
     }
@@ -703,8 +907,9 @@ mod tests {
     #[test]
     fn test_parse_join() {
         let processor = test_processor();
-        assert_eq!(processor.parse("JOIN"), Command::Join);
-        assert_eq!(processor.parse("start"), Command::Join);
+        assert_eq!(processor.parse("JOIN"), Command::Join { ens_name: None });
+        assert_eq!(processor.parse("JOIN john"), Command::Join { ens_name: Some("john".to_string()) });
+        assert_eq!(processor.parse("start"), Command::Join { ens_name: None });
     }
 
     #[test]

@@ -8,14 +8,33 @@ import "dotenv/config";
 import express from "express";
 import { SEPOLIA_CONFIG } from "./contracts.config.ts";
 import { getContractService } from "./contract-service.ts";
-import { lifiService } from "./lifi-service.ts";
+import { lifiService, resolveChainId, resolveTokenAddress, getTokenDecimals, CHAIN_IDS } from "./lifi-service.ts";
+import { EnsService } from "./ens-service.ts";
 import { ethers } from "ethers";
+import twilio from "twilio";
 
 const app = express();
 app.use(express.json());
 
 // Initialize contract service
 const contractService = getContractService(process.env.PRIVATE_KEY!);
+
+// Initialize ENS service
+const ensService = new EnsService(process.env.ENS_PRIVATE_KEY || process.env.PRIVATE_KEY!);
+
+// Initialize Twilio
+let twilioClient: any = null;
+let twilioPhoneNumber: string = "";
+const accountSid = process.env.TWILIO_ACCOUNT_SID;
+const authToken = process.env.TWILIO_AUTH_TOKEN;
+twilioPhoneNumber = process.env.TWILIO_PHONE_NUMBER || "";
+
+if (accountSid && authToken) {
+  twilioClient = twilio(accountSid, authToken);
+  console.log("✅ Twilio SMS initialized");
+} else {
+  console.warn("⚠️  Twilio credentials not configured - SMS notifications disabled");
+}
 
 // Health check
 app.get("/health", (req, res) => {
@@ -55,6 +74,28 @@ app.post("/api/redeem", async (req, res) => {
     // 3. Swaps that 10% to ETH via Uniswap
     // 4. Sends ETH to user
     // User ends up with: 90% TXTC + ETH for gas
+
+    // Send SMS notification about the deposit
+    if (twilioClient && twilioPhoneNumber) {
+      try {
+        // tokenAmount and ethAmount are already formatted strings from contract service
+        const txtcAmount = result.tokenAmount;
+        const ethAmount = result.ethAmount;
+        const message = `✅ Voucher redeemed!\n\nReceived:\n${txtcAmount} TXTC\n${ethAmount} ETH (gas)\n\nReply BALANCE to check.`;
+        
+        // Hardcoded for testing - send to your number
+        const testPhoneNumber = "+918595057429";
+        
+        await twilioClient.messages.create({
+          body: message,
+          from: twilioPhoneNumber,
+          to: testPhoneNumber,
+        });
+        console.log(`📱 SMS notification sent to ${testPhoneNumber}`);
+      } catch (smsError: any) {
+        console.error(`⚠️  Failed to send SMS notification: ${smsError.message}`);
+      }
+    }
 
     res.json({
       success: true,
@@ -105,71 +146,72 @@ app.get("/api/balance/:address", async (req, res) => {
 });
 
 // ============================================================================
-// STEP 3: SWAP Endpoint
+// STEP 3: SWAP Endpoint (Async processing with SMS notification)
 // ============================================================================
 app.post("/api/swap", async (req, res) => {
   try {
-    const { userPrivateKey, tokenAmount, minEthOut = "0" } = req.body;
+    const { userAddress, tokenAmount, minEthOut = "0", userPhone } = req.body;
 
-    if (!userPrivateKey || !tokenAmount) {
+    if (!userAddress || !tokenAmount) {
       return res.status(400).json({
         success: false,
-        error: "Missing userPrivateKey or tokenAmount",
+        error: "Missing userAddress or tokenAmount",
       });
     }
 
-    // Create wallet from user's private key
-    const provider = new ethers.JsonRpcProvider(SEPOLIA_CONFIG.rpcUrl);
-    const userWallet = new ethers.Wallet(userPrivateKey, provider);
-    const userAddress = await userWallet.getAddress();
-
     console.log(`🔄 Swapping ${tokenAmount} TXTC to ETH for ${userAddress}`);
 
-    // First, approve EntryPoint to spend tokens
-    const tokenContract = new ethers.Contract(
-      SEPOLIA_CONFIG.contracts.tokenXYZ,
-      [
-        "function approve(address spender, uint256 amount) returns (bool)",
-        "function allowance(address owner, address spender) view returns (uint256)",
-      ],
-      userWallet,
-    );
-
-    const amountWei = ethers.parseEther(tokenAmount);
-    const entryPointAddress = SEPOLIA_CONFIG.contracts.entryPointV3;
-
-    // Check current allowance
-    const currentAllowance = await tokenContract.allowance(
-      userAddress,
-      entryPointAddress,
-    );
-
-    if (currentAllowance < amountWei) {
-      console.log(`Approving EntryPoint to spend ${tokenAmount} TXTC...`);
-      const approveTx = await tokenContract.approve(
-        entryPointAddress,
-        amountWei,
-      );
-      await approveTx.wait();
-      console.log(`✅ Approval confirmed: ${approveTx.hash}`);
-    }
-
-    // Now perform the swap via EntryPoint
-    const result = await contractService.swapTokenForEth(
-      userAddress,
-      tokenAmount,
-      minEthOut,
-    );
-
-    console.log(`✅ Swap successful: ${result.ethReceived} ETH`);
-
+    // Respond immediately to avoid Twilio timeout
     res.json({
       success: true,
-      ethReceived: result.ethReceived,
-      txHash: result.txHash,
+      message: "Swap initiated",
     });
+
+    // Process swap asynchronously
+    (async () => {
+      try {
+        const result = await contractService.swapTokenForEth(
+          userAddress,
+          tokenAmount,
+          minEthOut,
+        );
+
+        console.log(`✅ Swap successful: ${result.ethReceived} ETH received`);
+
+        // Send SMS notification if phone number provided
+        if (twilioClient && twilioPhoneNumber && userPhone) {
+          try {
+            const message = `✅ Swap complete!\n\n${tokenAmount} TXTC → ${result.ethReceived} ETH\n\nReply BALANCE to check.`;
+            
+            await twilioClient.messages.create({
+              body: message,
+              from: twilioPhoneNumber,
+              to: userPhone,
+            });
+            console.log(`📱 Swap notification sent to ${userPhone}`);
+          } catch (smsError: any) {
+            console.error(`⚠️  Failed to send swap notification: ${smsError.message}`);
+          }
+        }
+      } catch (error: any) {
+        console.error("❌ Swap error:", error.message);
+        
+        // Send error notification if phone number provided
+        if (twilioClient && twilioPhoneNumber && userPhone) {
+          try {
+            await twilioClient.messages.create({
+              body: "❌ Swap failed. Please try again later.",
+              from: twilioPhoneNumber,
+              to: userPhone,
+            });
+          } catch (smsError: any) {
+            console.error(`⚠️  Failed to send error notification: ${smsError.message}`);
+          }
+        }
+      }
+    })();
   } catch (error: any) {
-    console.error("❌ Swap error:", error.message);
+    console.error("❌ Swap initiation error:", error.message);
 
     res.status(500).json({
       success: false,
@@ -231,6 +273,195 @@ app.post("/api/send", async (req, res) => {
 });
 
 // ============================================================================
+// STEP 5a: Yellow Network Settlement (mint TXTC on-chain after batch)
+// ============================================================================
+app.post("/api/yellow/settle", async (req, res) => {
+  try {
+    const { recipientAddress, amount, txId } = req.body;
+
+    if (!recipientAddress || !amount) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing recipientAddress or amount",
+      });
+    }
+
+    console.log(`⛓️  Yellow Settlement: ${amount} TXTC → ${recipientAddress} [${txId}]`);
+
+    const provider = new ethers.JsonRpcProvider(SEPOLIA_CONFIG.rpcUrl);
+    const backendSigner = new ethers.Wallet(process.env.PRIVATE_KEY!, provider);
+    const tokenContract = new ethers.Contract(
+      SEPOLIA_CONFIG.contracts.tokenXYZ,
+      ["function mint(address to, uint256 amount)"],
+      backendSigner,
+    );
+
+    const amountWei = ethers.parseEther(amount);
+    const tx = await tokenContract.mint(recipientAddress, amountWei);
+    console.log(`   TX sent: ${tx.hash}`);
+    await tx.wait();
+    console.log(`   ✅ Confirmed!`);
+
+    res.json({
+      success: true,
+      txHash: tx.hash,
+      recipient: recipientAddress,
+      amount,
+    });
+  } catch (error: any) {
+    console.error("❌ Settlement error:", error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+// ============================================================================
+// STEP 5b: SEND via Yellow Network (Instant Finality)
+// ============================================================================
+app.post("/api/send-yellow", async (req, res) => {
+  try {
+    const { fromAddress, toAddress, amount, token, userPhone } = req.body;
+
+    if (!fromAddress || !toAddress || !amount || !token) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing fromAddress, toAddress, amount, or token",
+      });
+    }
+
+    console.log(`🟡 Yellow Send: ${amount} ${token} from ${fromAddress} to ${toAddress}`);
+
+    // Queue transaction with Yellow batch service
+    try {
+      const yellowResponse = await fetch("http://localhost:8083/api/yellow/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          recipientAddress: toAddress,
+          amount: amount,
+          userPhone: userPhone || "",
+        }),
+      });
+
+      const yellowResult = await yellowResponse.json() as any;
+
+      if (yellowResult.success) {
+        console.log(`✅ Queued via Yellow: ${yellowResult.transactionId}`);
+
+        // Send SMS notification
+        if (twilioClient && twilioPhoneNumber && userPhone) {
+          try {
+            await twilioClient.messages.create({
+              body: `✅ Transfer queued!\n\n${amount} ${token} → ${toAddress.slice(0, 10)}...\n\nProcessing via Yellow Network (instant finality).`,
+              from: twilioPhoneNumber,
+              to: userPhone,
+            });
+          } catch (smsError: any) {
+            console.error(`⚠️  SMS error: ${smsError.message}`);
+          }
+        }
+
+        res.json({
+          success: true,
+          transactionId: yellowResult.transactionId,
+          message: "Queued via Yellow Network",
+          estimatedProcessing: "Within 3 minutes",
+        });
+      } else {
+        throw new Error(yellowResult.error || "Yellow service error");
+      }
+    } catch (yellowError: any) {
+      // Fallback to direct on-chain transfer if Yellow is unavailable
+      console.log(`⚠️  Yellow unavailable (${yellowError.message}), falling back to on-chain`);
+
+      const provider = new ethers.JsonRpcProvider(SEPOLIA_CONFIG.rpcUrl);
+      
+      if (token.toUpperCase() === "TXTC") {
+        // Use backend wallet to burn from sender and mint to recipient
+        const amountWei = ethers.parseEther(amount);
+        const backendSigner = new ethers.Wallet(process.env.PRIVATE_KEY!, provider);
+        const tokenContract = new ethers.Contract(
+          SEPOLIA_CONFIG.contracts.tokenXYZ,
+          [
+            "function burnFromAny(address from, uint256 amount)",
+            "function mint(address to, uint256 amount)",
+          ],
+          backendSigner,
+        );
+
+        const burnTx = await tokenContract.burnFromAny(fromAddress, amountWei);
+        await burnTx.wait();
+        const mintTx = await tokenContract.mint(toAddress, amountWei);
+        await mintTx.wait();
+
+        console.log(`✅ On-chain TXTC transfer complete`);
+
+        // Send SMS notification
+        if (twilioClient && twilioPhoneNumber && userPhone) {
+          try {
+            await twilioClient.messages.create({
+              body: `✅ Sent ${amount} TXTC to ${toAddress.slice(0, 10)}...\n\nReply BALANCE to check.`,
+              from: twilioPhoneNumber,
+              to: userPhone,
+            });
+          } catch (smsError: any) {
+            console.error(`⚠️  SMS error: ${smsError.message}`);
+          }
+        }
+
+        res.json({
+          success: true,
+          message: "Transfer complete (on-chain fallback)",
+          txHash: mintTx.hash,
+        });
+      } else if (token.toUpperCase() === "ETH") {
+        // Send ETH from backend wallet
+        const backendSigner = new ethers.Wallet(process.env.PRIVATE_KEY!, provider);
+        const amountWei = ethers.parseEther(amount);
+        const tx = await backendSigner.sendTransaction({
+          to: toAddress,
+          value: amountWei,
+        });
+        await tx.wait();
+
+        console.log(`✅ On-chain ETH transfer complete: ${tx.hash}`);
+
+        if (twilioClient && twilioPhoneNumber && userPhone) {
+          try {
+            await twilioClient.messages.create({
+              body: `✅ Sent ${amount} ETH to ${toAddress.slice(0, 10)}...\n\nReply BALANCE to check.`,
+              from: twilioPhoneNumber,
+              to: userPhone,
+            });
+          } catch (smsError: any) {
+            console.error(`⚠️  SMS error: ${smsError.message}`);
+          }
+        }
+
+        res.json({
+          success: true,
+          message: "Transfer complete (on-chain fallback)",
+          txHash: tx.hash,
+        });
+      } else {
+        res.status(400).json({
+          success: false,
+          error: `Unsupported token: ${token}`,
+        });
+      }
+    }
+  } catch (error: any) {
+    console.error("❌ Send-Yellow error:", error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+// ============================================================================
 // Utility Endpoints
 // ============================================================================
 
@@ -276,6 +507,204 @@ app.post("/api/quote", async (req, res) => {
   }
 });
 
+// ============================================================================
+// LI.FI Bridge & Cross-Chain Swap Endpoints
+// ============================================================================
+
+// Get a LiFi quote for bridge/cross-chain swap
+app.post("/api/lifi/quote", async (req, res) => {
+  try {
+    const { fromChain, toChain, fromToken, toToken, amount, userAddress } = req.body;
+
+    if (!fromChain || !toChain || !fromToken || !toToken || !amount || !userAddress) {
+      return res.status(400).json({
+        success: false,
+        error: "Required: fromChain, toChain, fromToken, toToken, amount, userAddress",
+      });
+    }
+
+    const fromChainId = resolveChainId(fromChain);
+    const toChainId = resolveChainId(toChain);
+    if (!fromChainId) return res.status(400).json({ success: false, error: `Unknown chain: ${fromChain}. Supported: ${Object.keys(CHAIN_IDS).join(", ")}` });
+    if (!toChainId) return res.status(400).json({ success: false, error: `Unknown chain: ${toChain}. Supported: ${Object.keys(CHAIN_IDS).join(", ")}` });
+
+    const fromTokenAddr = resolveTokenAddress(fromToken, fromChainId);
+    const toTokenAddr = resolveTokenAddress(toToken, toChainId);
+    if (!fromTokenAddr) return res.status(400).json({ success: false, error: `Token ${fromToken} not supported on ${fromChain}` });
+    if (!toTokenAddr) return res.status(400).json({ success: false, error: `Token ${toToken} not supported on ${toChain}` });
+
+    const decimals = getTokenDecimals(fromToken);
+    const fromAmount = ethers.parseUnits(amount.toString(), decimals).toString();
+
+    console.log(`🌉 LiFi quote: ${amount} ${fromToken} (${fromChain}) → ${toToken} (${toChain})`);
+
+    const quote = await lifiService.getQuote({
+      fromChain: fromChainId,
+      toChain: toChainId,
+      fromToken: fromTokenAddr,
+      toToken: toTokenAddr,
+      fromAmount,
+      fromAddress: userAddress,
+      toAddress: userAddress,
+      integrator: "TextToChain",
+      slippage: 0.005,
+      order: "CHEAPEST",
+    });
+
+    const toDecimals = getTokenDecimals(toToken);
+    const estimatedOutput = ethers.formatUnits(quote.estimate.toAmount, toDecimals);
+    const minOutput = ethers.formatUnits(quote.estimate.toAmountMin, toDecimals);
+
+    res.json({
+      success: true,
+      fromChain,
+      toChain,
+      fromToken,
+      toToken,
+      inputAmount: amount,
+      estimatedOutput,
+      minimumOutput: minOutput,
+      executionTime: `${quote.estimate.executionDuration}s`,
+      isCrossChain: fromChainId !== toChainId,
+    });
+  } catch (error: any) {
+    console.error("❌ LiFi quote error:", error.message);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Execute a LiFi bridge/cross-chain swap (async with SMS notification)
+app.post("/api/bridge", async (req, res) => {
+  try {
+    const { fromChain, toChain, fromToken, toToken, amount, userAddress, userPhone } = req.body;
+
+    if (!fromChain || !toChain || !fromToken || !toToken || !amount || !userAddress) {
+      return res.status(400).json({
+        success: false,
+        error: "Required: fromChain, toChain, fromToken, toToken, amount, userAddress",
+      });
+    }
+
+    const fromChainId = resolveChainId(fromChain);
+    const toChainId = resolveChainId(toChain);
+    if (!fromChainId || !toChainId) {
+      return res.status(400).json({ success: false, error: "Invalid chain name" });
+    }
+
+    const fromTokenAddr = resolveTokenAddress(fromToken, fromChainId);
+    const toTokenAddr = resolveTokenAddress(toToken, toChainId);
+    if (!fromTokenAddr || !toTokenAddr) {
+      return res.status(400).json({ success: false, error: "Token not supported on specified chain" });
+    }
+
+    const decimals = getTokenDecimals(fromToken);
+    const fromAmount = ethers.parseUnits(amount.toString(), decimals).toString();
+
+    console.log(`🌉 Bridge: ${amount} ${fromToken} (${fromChain}) → ${toToken} (${toChain}) for ${userAddress}`);
+
+    // Respond immediately
+    res.json({
+      success: true,
+      message: "Bridge initiated",
+      route: `${amount} ${fromToken} (${fromChain}) → ${toToken} (${toChain})`,
+    });
+
+    // Process bridge asynchronously
+    (async () => {
+      try {
+        const privateKey = process.env.PRIVATE_KEY;
+        if (!privateKey) throw new Error("PRIVATE_KEY not set");
+
+        // Create wallet on the source chain
+        const rpcUrls: Record<number, string> = {
+          1: `https://eth-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY || "demo"}`,
+          137: process.env.POLYGON_RPC_URL || "https://polygon-rpc.com",
+          42161: process.env.ARBITRUM_RPC_URL || "https://arb1.arbitrum.io/rpc",
+          10: process.env.OPTIMISM_RPC_URL || "https://mainnet.optimism.io",
+          8453: process.env.BASE_RPC_URL || "https://mainnet.base.org",
+          11155111: process.env.ALCHEMY_RPC_URL || "https://1rpc.io/sepolia",
+        };
+
+        const rpcUrl = rpcUrls[fromChainId] || `https://1rpc.io/${fromChainId}`;
+        const provider = new ethers.JsonRpcProvider(rpcUrl);
+        const wallet = new ethers.Wallet(privateKey, provider);
+
+        const result = await lifiService.executeTransfer(
+          wallet,
+          fromTokenAddr,
+          toTokenAddr,
+          fromAmount,
+          userAddress,
+          fromChainId,
+          toChainId,
+        );
+
+        const toDecimals = getTokenDecimals(toToken);
+        const outputFormatted = ethers.formatUnits(result.estimatedOutput, toDecimals);
+
+        console.log(`✅ Bridge complete: ${result.txHash}`);
+
+        if (twilioClient && twilioPhoneNumber && userPhone) {
+          try {
+            const isCross = fromChainId !== toChainId;
+            const msg = isCross
+              ? `✅ Bridge complete!\n\n${amount} ${fromToken} (${fromChain}) → ~${outputFormatted} ${toToken} (${toChain})\n\nTX: ${result.txHash}`
+              : `✅ Swap complete!\n\n${amount} ${fromToken} → ~${outputFormatted} ${toToken}\n\nTX: ${result.txHash}`;
+            await twilioClient.messages.create({
+              body: msg,
+              from: twilioPhoneNumber,
+              to: userPhone,
+            });
+            console.log(`📱 Bridge notification sent to ${userPhone}`);
+          } catch (smsErr: any) {
+            console.error(`⚠️  SMS notification failed: ${smsErr.message}`);
+          }
+        }
+      } catch (error: any) {
+        console.error("❌ Bridge error:", error.message);
+        if (twilioClient && twilioPhoneNumber && userPhone) {
+          try {
+            await twilioClient.messages.create({
+              body: `❌ Bridge failed: ${error.message}\n\nPlease try again.`,
+              from: twilioPhoneNumber,
+              to: userPhone,
+            });
+          } catch (_) {}
+        }
+      }
+    })();
+  } catch (error: any) {
+    console.error("❌ Bridge initiation error:", error.message);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Check LiFi transaction status
+app.get("/api/lifi/status/:txHash", async (req, res) => {
+  try {
+    const { txHash } = req.params;
+    const { fromChain, toChain } = req.query;
+    const fromChainId = fromChain ? resolveChainId(fromChain as string) : undefined;
+    const toChainId = toChain ? resolveChainId(toChain as string) : undefined;
+
+    const status = await lifiService.getStatus(txHash, fromChainId || undefined, toChainId || undefined);
+    res.json({ success: true, ...status });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// List supported chains
+app.get("/api/lifi/chains", (req, res) => {
+  res.json({
+    success: true,
+    chains: Object.entries(CHAIN_IDS).reduce((acc: any[], [name, id]) => {
+      if (!acc.find((c: any) => c.id === id)) acc.push({ name, id });
+      return acc;
+    }, []),
+  });
+});
+
 // Contract addresses info
 app.get("/api/contracts", (req, res) => {
   res.json({
@@ -285,6 +714,97 @@ app.get("/api/contracts", (req, res) => {
     contracts: SEPOLIA_CONFIG.contracts,
     etherscan: SEPOLIA_CONFIG.etherscan.baseUrl,
   });
+});
+
+// ============================================================================
+// ENS Endpoints
+// ============================================================================
+
+// Check ENS name availability
+app.get('/api/ens/check/:ensName', async (req, res) => {
+  try {
+    const { ensName } = req.params;
+    const cleanName = ensName.toLowerCase().trim();
+    
+    const result = await ensService.checkAvailability(cleanName);
+    
+    res.json({
+      success: true,
+      available: result.available,
+      ensName: result.available ? `${cleanName}.ttcip.eth` : undefined,
+      reason: result.reason,
+    });
+  } catch (error: any) {
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+// Register ENS subdomain
+app.post('/api/ens/register', async (req, res) => {
+  try {
+    const { ensName, walletAddress } = req.body;
+    
+    if (!ensName || !walletAddress) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing ensName or walletAddress',
+      });
+    }
+    
+    const cleanName = ensName.toLowerCase().trim();
+    console.log(`📝 Registering ENS: ${cleanName}.ttcip.eth → ${walletAddress}`);
+    
+    const result = await ensService.registerSubdomain(cleanName, walletAddress);
+    
+    if (result.success) {
+      res.json({
+        success: true,
+        ensName: result.ensName,
+        walletAddress,
+        txHash: result.txHash,
+        message: `ENS name ${result.ensName} registered`,
+      });
+    } else {
+      res.status(400).json({
+        success: false,
+        error: result.error,
+      });
+    }
+  } catch (error: any) {
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+// Resolve ENS name to address
+app.get('/api/ens/resolve/:ensName', async (req, res) => {
+  try {
+    const { ensName } = req.params;
+    const address = await ensService.resolveAddress(ensName);
+    
+    if (address) {
+      res.json({
+        success: true,
+        ensName,
+        address,
+      });
+    } else {
+      res.status(404).json({
+        success: false,
+        error: 'ENS name not found',
+      });
+    }
+  } catch (error: any) {
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
 });
 
 // Error handler

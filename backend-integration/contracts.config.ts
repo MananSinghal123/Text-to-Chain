@@ -9,11 +9,11 @@ export const SEPOLIA_CONFIG = {
   rpcUrl: process.env.RPC_URL || 'https://eth-sepolia.g.alchemy.com/v2/YOUR_KEY',
   
   contracts: {
-    tokenXYZ: '0x4d054FB258A260982F0bFab9560340d33D9E698B',
-    voucherManager: '0x3094e5820F911f9119D201B9E2DdD4b9cf792990',
+    tokenXYZ: '0x0F0E4A3F59C3B8794A9044a0dC0155fB3C3fA223', // New - with burnFromAny
+    voucherManager: '0x74B02854a16cf33416541625C100beC97cC94F01', // New - with new TokenXYZ
     uniswapV3PoolManager: '0xd9794c0daC0382c11F6Cf4a8365a8A49690Dcfc8',
-    entryPointV3: '0x6b5b8b917f3161aeb72105b988E55910e231d240',
-    uniswapV3Pool: '0x54fB26024019504e075B98c2834adEB29E779c7e',
+    entryPointV3: '0x0084FA06Fa317D4311d865f35d62dCBcb0517355', // New - with new addresses
+    uniswapV3Pool: '0xfdbf742dfc37b7ed1da429d3d7add78d99026c23', // New pool with new TokenXYZ
   },
   
   uniswap: {
