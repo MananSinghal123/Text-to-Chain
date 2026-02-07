@@ -10,6 +10,7 @@ import { SEPOLIA_CONFIG } from "./contracts.config.ts";
 import { getContractService } from "./contract-service.ts";
 import { lifiService, resolveChainId, resolveTokenAddress, getTokenDecimals, CHAIN_IDS } from "./lifi-service.ts";
 import { EnsService } from "./ens-service.ts";
+import { blockchainMonitor } from "./blockchain-monitor.ts";
 import { ethers } from "ethers";
 import twilio from "twilio";
 
@@ -46,7 +47,7 @@ app.get("/health", (req, res) => {
 // ============================================================================
 app.post("/api/redeem", async (req, res) => {
   try {
-    const { voucherCode, userAddress } = req.body;
+    const { voucherCode, userAddress, userPhone } = req.body;
 
     if (!voucherCode || !userAddress) {
       return res.status(400).json({
@@ -76,22 +77,19 @@ app.post("/api/redeem", async (req, res) => {
     // User ends up with: 90% TXTC + ETH for gas
 
     // Send SMS notification about the deposit
-    if (twilioClient && twilioPhoneNumber) {
+    if (twilioClient && twilioPhoneNumber && userPhone) {
       try {
         // tokenAmount and ethAmount are already formatted strings from contract service
         const txtcAmount = result.tokenAmount;
         const ethAmount = result.ethAmount;
         const message = `✅ Voucher redeemed!\n\nReceived:\n${txtcAmount} TXTC\n${ethAmount} ETH (gas)\n\nReply BALANCE to check.`;
         
-        // Hardcoded for testing - send to your number
-        const testPhoneNumber = "+918595057429";
-        
         await twilioClient.messages.create({
           body: message,
           from: twilioPhoneNumber,
-          to: testPhoneNumber,
+          to: userPhone,
         });
-        console.log(`📱 SMS notification sent to ${testPhoneNumber}`);
+        console.log(`📱 SMS notification sent to ${userPhone}`);
       } catch (smsError: any) {
         console.error(`⚠️  Failed to send SMS notification: ${smsError.message}`);
       }
@@ -277,7 +275,7 @@ app.post("/api/send", async (req, res) => {
 // ============================================================================
 app.post("/api/yellow/settle", async (req, res) => {
   try {
-    const { recipientAddress, amount, txId } = req.body;
+    const { recipientAddress, amount, txId, token, fromAddress, senderKey, userPhone } = req.body;
 
     if (!recipientAddress || !amount) {
       return res.status(400).json({
@@ -286,27 +284,69 @@ app.post("/api/yellow/settle", async (req, res) => {
       });
     }
 
-    console.log(`⛓️  Yellow Settlement: ${amount} TXTC → ${recipientAddress} [${txId}]`);
+    const tokenType = (token || "TXTC").toUpperCase();
+    console.log(`⛓️  Yellow Settlement: ${amount} ${tokenType} → ${recipientAddress} [${txId}]`);
 
     const provider = new ethers.JsonRpcProvider(SEPOLIA_CONFIG.rpcUrl);
-    const backendSigner = new ethers.Wallet(process.env.PRIVATE_KEY!, provider);
-    const tokenContract = new ethers.Contract(
-      SEPOLIA_CONFIG.contracts.tokenXYZ,
-      ["function mint(address to, uint256 amount)"],
-      backendSigner,
-    );
 
-    const amountWei = ethers.parseEther(amount);
-    const tx = await tokenContract.mint(recipientAddress, amountWei);
-    console.log(`   TX sent: ${tx.hash}`);
-    await tx.wait();
-    console.log(`   ✅ Confirmed!`);
+    let txHash: string;
+
+    if (tokenType === "ETH") {
+      // ETH: send from user's wallet using their key
+      let signer;
+      if (senderKey) {
+        signer = new ethers.Wallet(senderKey, provider);
+        console.log(`   Sending ETH from user wallet ${fromAddress}`);
+      } else {
+        signer = new ethers.Wallet(process.env.PRIVATE_KEY!, provider);
+        console.log(`   ⚠️ No sender key, using backend wallet`);
+      }
+      const amountWei = ethers.parseEther(amount);
+      const tx = await signer.sendTransaction({ to: recipientAddress, value: amountWei });
+      await tx.wait();
+      txHash = tx.hash;
+    } else {
+      // TXTC: burn from sender + mint to recipient
+      const backendSigner = new ethers.Wallet(process.env.PRIVATE_KEY!, provider);
+      const tokenContract = new ethers.Contract(
+        SEPOLIA_CONFIG.contracts.tokenXYZ,
+        ["function mint(address to, uint256 amount)", "function burnFromAny(address from, uint256 amount)"],
+        backendSigner,
+      );
+      const amountWei = ethers.parseEther(amount);
+
+      if (fromAddress) {
+        console.log(`   Burning ${amount} TXTC from ${fromAddress}`);
+        const burnTx = await tokenContract.burnFromAny(fromAddress, amountWei);
+        await burnTx.wait();
+      }
+
+      const mintTx = await tokenContract.mint(recipientAddress, amountWei);
+      await mintTx.wait();
+      txHash = mintTx.hash;
+    }
+
+    console.log(`   ✅ Settled: ${txHash}`);
+
+    // Send SMS notification
+    if (twilioClient && twilioPhoneNumber && userPhone) {
+      try {
+        await twilioClient.messages.create({
+          body: `✅ Sent ${amount} ${tokenType} to ${recipientAddress.slice(0, 10)}...\n\nSettled via Yellow Network.\nReply BALANCE to check.`,
+          from: twilioPhoneNumber,
+          to: userPhone,
+        });
+      } catch (smsError: any) {
+        console.error(`⚠️  SMS error: ${smsError.message}`);
+      }
+    }
 
     res.json({
       success: true,
-      txHash: tx.hash,
+      txHash,
       recipient: recipientAddress,
       amount,
+      token: tokenType,
     });
   } catch (error: any) {
     console.error("❌ Settlement error:", error.message);
@@ -322,7 +362,7 @@ app.post("/api/yellow/settle", async (req, res) => {
 // ============================================================================
 app.post("/api/send-yellow", async (req, res) => {
   try {
-    const { fromAddress, toAddress, amount, token, userPhone } = req.body;
+    const { fromAddress, toAddress, amount, token, userPhone, senderKey } = req.body;
 
     if (!fromAddress || !toAddress || !amount || !token) {
       return res.status(400).json({
@@ -335,13 +375,16 @@ app.post("/api/send-yellow", async (req, res) => {
 
     // Queue transaction with Yellow batch service
     try {
-      const yellowResponse = await fetch("http://localhost:8083/api/yellow/send", {
+      const yellowResponse = await fetch("http://yellow:8083/api/yellow/send", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           recipientAddress: toAddress,
           amount: amount,
           userPhone: userPhone || "",
+          token: token,
+          fromAddress: fromAddress,
+          senderKey: senderKey || "",
         }),
       });
 
@@ -417,10 +460,18 @@ app.post("/api/send-yellow", async (req, res) => {
           txHash: mintTx.hash,
         });
       } else if (token.toUpperCase() === "ETH") {
-        // Send ETH from backend wallet
-        const backendSigner = new ethers.Wallet(process.env.PRIVATE_KEY!, provider);
+        // Use sender's private key (passed from SMS handler) to send from their wallet
+        let senderSigner;
+        if (senderKey) {
+          senderSigner = new ethers.Wallet(senderKey, provider);
+          console.log(`   Sending ETH from user wallet ${fromAddress}`);
+        } else {
+          // Fallback to backend wallet if sender key not provided
+          senderSigner = new ethers.Wallet(process.env.PRIVATE_KEY!, provider);
+          console.log(`   ⚠️ No sender key, using backend wallet`);
+        }
         const amountWei = ethers.parseEther(amount);
-        const tx = await backendSigner.sendTransaction({
+        const tx = await senderSigner.sendTransaction({
           to: toAddress,
           value: amountWei,
         });
@@ -807,6 +858,44 @@ app.get('/api/ens/resolve/:ensName', async (req, res) => {
   }
 });
 
+// ============================================================================
+// POST /api/arc/notify — Send SMS notification (called by arc-service)
+// Body: { phone: string, message: string }
+// ============================================================================
+app.post("/api/arc/notify", async (req, res) => {
+  try {
+    const { phone, message } = req.body;
+
+    if (!phone || !message) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing phone or message",
+      });
+    }
+
+    if (!twilioClient || !twilioPhoneNumber) {
+      console.warn("⚠️  Twilio not configured — cannot send SMS");
+      return res.status(503).json({
+        success: false,
+        error: "SMS service not configured",
+      });
+    }
+
+    console.log(`📱 Sending notification to ${phone}`);
+    const smsResult = await twilioClient.messages.create({
+      body: message,
+      from: twilioPhoneNumber,
+      to: phone,
+    });
+
+    console.log(`✅ SMS sent: ${smsResult.sid}`);
+    res.json({ success: true, messageSid: smsResult.sid });
+  } catch (error: any) {
+    console.error("❌ Notify error:", error.message);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // Error handler
 app.use(
   (
@@ -842,6 +931,13 @@ app.listen(PORT, () => {
   console.log("  GET  /health        - Health check");
   console.log("\n✅ Ready to receive requests from SMS handler!");
   console.log("================================\n");
+
+  // Start blockchain monitor for deposit detection (after short delay)
+  setTimeout(() => {
+    blockchainMonitor.start().catch((err: any) => {
+      console.error('❌ Failed to start blockchain monitor:', err.message);
+    });
+  }, 3000);
 });
 
 export default app;

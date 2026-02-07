@@ -66,8 +66,8 @@ impl IntoResponse for JsonResponse {
 
 /// Handler for incoming SMS messages from Twilio (Form-encoded)
 ///
-/// This receives the webhook from Twilio, processes the command,
-/// and returns a TwiML response with the reply message.
+/// Responds immediately with empty TwiML to avoid Twilio's 15s timeout,
+/// then processes the command and sends the reply via Twilio REST API.
 pub async fn incoming_sms_handler(
     State(state): State<AppState>,
     Form(sms): Form<IncomingSms>,
@@ -78,26 +78,42 @@ pub async fn incoming_sms_handler(
         "Received SMS (Twilio format)"
     );
 
-    // Process the command
-    let response_text = state
-        .command_processor
-        .process(&sms.from, &sms.body)
-        .await;
+    let from = sms.from.clone();
+    let body = sms.body.clone();
+    let processor = state.command_processor.clone();
+    let twilio = state.twilio.clone();
 
-    tracing::info!(
-        to = %sms.from,
-        response = %response_text,
-        "Sending SMS response"
-    );
+    // Process command in background and send reply via Twilio API
+    tokio::spawn(async move {
+        let response_text = processor.process(&from, &body).await;
 
-    // Return TwiML response
-    let twiml = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Message>{}</Message>
-</Response>"#,
-        escape_xml(&response_text)
-    );
+        tracing::info!(
+            to = %from,
+            response = %response_text,
+            "Sending SMS response via Twilio API"
+        );
+
+        match twilio.send_sms(&from, &response_text).await {
+            Ok(result) => {
+                tracing::info!(
+                    message_sid = %result.message_sid,
+                    status = %result.status,
+                    "SMS reply sent successfully"
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    to = %from,
+                    error = %e,
+                    "Failed to send SMS reply"
+                );
+            }
+        }
+    });
+
+    // Respond immediately with empty TwiML so Twilio doesn't timeout
+    let twiml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Response></Response>"#.to_string();
 
     TwimlResponse(twiml)
 }

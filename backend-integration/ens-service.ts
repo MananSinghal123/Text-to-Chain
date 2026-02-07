@@ -202,6 +202,10 @@ export class EnsService {
 
   /**
    * Register subdomain in ENS registry (for official ENS app visibility)
+   * Uses 3-step approach so ENS indexers can map the hash to human-readable name:
+   * 1. setSubnodeOwner - creates subdomain + emits NewOwner event (indexable)
+   * 2. setResolver - points subdomain to the Public Resolver
+   * 3. setAddr - sets the address record on the resolver
    */
   private async registerInENSRegistry(
     subdomain: string,
@@ -216,32 +220,53 @@ export class EnsService {
       console.log(`📝 Registering ${subdomain}.${this.parentDomain} in ENS registry...`);
 
       const ENS_REGISTRY = '0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e';
-      const RESOLVER_ADDRESS = ENS_REGISTRAR_ADDRESS;
+      const PUBLIC_RESOLVER = '0x8FADE66B79cC9f707aB26799354482EB93a5B7dD';
 
-      // Calculate ttcip.eth node
+      // Calculate ttcip.eth node and subdomain label hash
       const ttcipNode = ethers.namehash('ttcip.eth');
       const subdomainLabel = ethers.id(subdomain);
+      const subdomainNode = ethers.namehash(`${subdomain}.${this.parentDomain}`);
 
-      // Create contract interface for ENS registry
+      // Step 1: Set subnode owner (emits NewOwner event for ENS indexing)
       const ensRegistry = new ethers.Contract(
         ENS_REGISTRY,
         [
-          'function setSubnodeRecord(bytes32 node, bytes32 label, address owner, address resolver, uint64 ttl) external',
+          'function setSubnodeOwner(bytes32 node, bytes32 label, address owner) external returns (bytes32)',
+          'function setResolver(bytes32 node, address resolver) external',
         ],
         this.wallet
       );
 
-      // Register subdomain in ENS registry
-      const tx = await ensRegistry.setSubnodeRecord(
-        ttcipNode,
-        subdomainLabel,
-        owner,
-        RESOLVER_ADDRESS,
-        0
-      );
+      console.log(`  Step 1/3: Setting subdomain owner...`);
+      const tx1 = await ensRegistry.setSubnodeOwner(ttcipNode, subdomainLabel, await this.wallet.getAddress());
+      await tx1.wait();
+      console.log(`  ✅ Subdomain owner set`);
 
-      await tx.wait();
-      console.log(`✅ ${subdomain}.${this.parentDomain} registered in ENS registry`);
+      // Step 2: Set resolver to Public Resolver
+      console.log(`  Step 2/3: Setting resolver...`);
+      const tx2 = await ensRegistry.setResolver(subdomainNode, PUBLIC_RESOLVER);
+      await tx2.wait();
+      console.log(`  ✅ Resolver set`);
+
+      // Step 3: Set address record on the Public Resolver
+      console.log(`  Step 3/3: Setting address record...`);
+      const publicResolver = new ethers.Contract(
+        PUBLIC_RESOLVER,
+        [
+          'function setAddr(bytes32 node, address addr) external',
+        ],
+        this.wallet
+      );
+      const tx3 = await publicResolver.setAddr(subdomainNode, owner);
+      await tx3.wait();
+      console.log(`  ✅ Address record set`);
+
+      // Step 4: Transfer ownership to the actual owner
+      console.log(`  Transferring ownership to ${owner}...`);
+      const tx4 = await ensRegistry.setSubnodeOwner(ttcipNode, subdomainLabel, owner);
+      await tx4.wait();
+
+      console.log(`✅ ${subdomain}.${this.parentDomain} fully registered in ENS registry`);
     } catch (error: any) {
       console.error('❌ Failed to register in ENS registry:', error.message);
       // Don't throw - subdomain is still registered in our resolver
@@ -250,4 +275,4 @@ export class EnsService {
 }
 
 // Export singleton instance
-export const ensService = new EnsService(process.env.ENS_PRIVATE_KEY);
+export const ensService = new EnsService(process.env.ENS_PRIVATE_KEY || process.env.PRIVATE_KEY);

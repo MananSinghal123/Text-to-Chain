@@ -186,19 +186,16 @@ export class BlockchainMonitor {
       const ensName = userInfo.ensName || 'your wallet';
       const message = `✅ Deposit received!\n+${depositAmount.toFixed(4)} ETH to ${ensName}\n\nUser: ${userInfo.phone}\nNew balance: ${newBalance.toFixed(4)} ETH`;
 
-      // For testing: send to verified number instead of user's number
-      const testPhoneNumber = process.env.TEST_PHONE_NUMBER || userInfo.phone;
-      
-      console.log(`📱 Sending SMS to ${testPhoneNumber} (user: ${userInfo.phone})`);
+      console.log(`📱 Sending deposit SMS to ${userInfo.phone}`);
 
       // Send via Twilio
       if (this.twilioClient && this.twilioPhoneNumber) {
         await this.twilioClient.messages.create({
           body: message,
           from: this.twilioPhoneNumber,
-          to: testPhoneNumber,
+          to: userInfo.phone,
         });
-        console.log(`✅ Deposit notification sent to ${testPhoneNumber}`);
+        console.log(`✅ Deposit notification sent to ${userInfo.phone}`);
       } else {
         console.log('⚠️  Twilio not configured - notification not sent');
         console.log(`📱 Would send: ${message}`);

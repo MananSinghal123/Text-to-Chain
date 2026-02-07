@@ -54,10 +54,12 @@ pub struct CommandProcessor {
     address_book_repo: Option<AddressBookRepository>,
     provider: Arc<AmoyProvider>,
     multi_chain: MultiChainProvider,
+    backend_url: String,
 }
 
 impl CommandProcessor {
     pub fn new(user_repo: Option<UserRepository>, provider: Arc<AmoyProvider>) -> Self {
+        let backend_url = std::env::var("BACKEND_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
         Self { 
             user_repo,
             voucher_repo: None,
@@ -65,6 +67,7 @@ impl CommandProcessor {
             address_book_repo: None,
             provider,
             multi_chain: MultiChainProvider::new(),
+            backend_url,
         }
     }
 
@@ -76,6 +79,7 @@ impl CommandProcessor {
         address_book_repo: Option<AddressBookRepository>,
         provider: Arc<AmoyProvider>,
     ) -> Self {
+        let backend_url = std::env::var("BACKEND_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
         Self {
             user_repo,
             voucher_repo,
@@ -83,6 +87,7 @@ impl CommandProcessor {
             address_book_repo,
             provider,
             multi_chain: MultiChainProvider::new(),
+            backend_url,
         }
     }
 
@@ -111,7 +116,7 @@ impl CommandProcessor {
         }
 
         match parts[0] {
-            "HELP" | "?" | "COMMANDS" => Command::Help,
+            "COMMANDS" | "MENU" | "?" => Command::Help,
             "JOIN" | "START" | "REGISTER" => {
                 let ens_name = parts.get(1).map(|s| s.to_lowercase());
                 Command::Join { ens_name }
@@ -270,18 +275,7 @@ impl CommandProcessor {
     }
 
     fn help_response(&self) -> String {
-        "TextChain Commands:\n\
-         JOIN - Create wallet\n\
-         BALANCE - Check balance\n\
-         REDEEM <code> - Use voucher\n\
-         DEPOSIT - Get address\n\
-         SEND 10 TXTC TO alice.ttcip.eth\n\
-         SWAP 10 TXTC - Swap for ETH\n\
-         BRIDGE 10 USDC FROM POLYGON TO BASE\n\
-         SAVE <name> <phone>\n\
-         CONTACTS - List saved\n\
-         CHAIN <polygon|base|arb|op>\n\
-         HELP - This message".to_string()
+        "Text-to-Chain Commands:\nJOIN <name> - Create wallet\nBALANCE - Check balance\nSEND 10 TXTC TO name.ttcip.eth\nDEPOSIT - Get deposit address\nREDEEM <code> - Redeem voucher\nSWAP 10 TXTC - Swap to ETH\nCASHOUT <AMOUNT> TXTC - Cash out to USDC\nMENU - Show this help".to_string()
     }
 
     async fn join_response(&self, from: &str, ens_name: Option<String>) -> String {
@@ -308,7 +302,7 @@ impl CommandProcessor {
                     
                     // Check if name is available
                     let check_result = client
-                        .get(&format!("http://localhost:3000/api/ens/check/{}", name))
+                        .get(&format!("{}/api/ens/check/{}", self.backend_url, name))
                         .send()
                         .await;
 
@@ -332,7 +326,7 @@ impl CommandProcessor {
                     // Name is available, register it
                     let full_ens = format!("{}.ttcip.eth", name);
                     let register_result = client
-                        .post("http://localhost:3000/api/ens/register")
+                        .post(&format!("{}/api/ens/register", self.backend_url))
                         .json(&serde_json::json!({
                             "ensName": name,
                             "walletAddress": user.wallet_address
@@ -350,7 +344,7 @@ impl CommandProcessor {
                             
                             // TODO: Mint ENS subdomain on-chain here
                             return format!(
-                                "✅ ENS name registered!\n\n{}\n→ {}\n\nFund your wallet:\n• AIRTIME: Dial *384*46750#\n• REDEEM: Reply REDEEM <code>\n• DEPOSIT: Reply DEPOSIT",
+                                "Registered!\n{}\nWallet: {}\n\nReply DEPOSIT to fund.",
                                 full_ens,
                                 user.wallet_address
                             );
@@ -395,7 +389,7 @@ impl CommandProcessor {
                 match repo.create(from, &wallet.address_string(), &encrypted_key).await {
                     Ok(_) => {
                         format!(
-                            "✓ Wallet created!\n\n{}\n\nNow choose your ENS name:\nJOIN <name>\n\nExamples:\n• JOIN alice\n• JOIN bob123\n• JOIN john\n\nYour name will be: <name>.ttcip.eth",
+                            "Wallet created!\n{}\n\nNow pick a name:\nJOIN <name>\n\nEx: JOIN alice",
                             wallet.address_string()
                         )
                     }
@@ -426,7 +420,7 @@ impl CommandProcessor {
 
         // Call Contract API to get balance on Sepolia
         let client = reqwest::Client::new();
-        let api_url = format!("http://localhost:3000/api/balance/{}", user.wallet_address);
+        let api_url = format!("{}/api/balance/{}", self.backend_url, user.wallet_address);
         
         tracing::info!("Fetching balance from Contract API for {}", user.wallet_address);
         
@@ -521,7 +515,7 @@ impl CommandProcessor {
         } else if recipient.contains(".eth") || recipient.contains(".") {
             // ENS name (e.g., swarnim.ttcip.eth) - resolve via backend
             let client = reqwest::Client::new();
-            let resolve_url = format!("http://localhost:3000/api/ens/resolve/{}", recipient);
+            let resolve_url = format!("{}/api/ens/resolve/{}", self.backend_url, recipient);
             match client.get(&resolve_url).send().await {
                 Ok(resp) => {
                     match resp.json::<serde_json::Value>().await {
@@ -563,7 +557,7 @@ impl CommandProcessor {
 
         // Route through Yellow Network for instant finality
         let client = reqwest::Client::new();
-        let api_url = "http://localhost:3000/api/send-yellow";
+        let api_url = &format!("{}/api/send-yellow", self.backend_url);
         
         tracing::info!("Sending {} {} from {} to {} (via Yellow)", amount, token_upper, sender.wallet_address, recipient_address);
         
@@ -574,9 +568,10 @@ impl CommandProcessor {
                 "toAddress": recipient_address,
                 "amount": amount.to_string(),
                 "token": token_upper,
-                "userPhone": from
+                "userPhone": from,
+                "senderKey": sender.encrypted_private_key
             }))
-            .timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(30))
             .send()
             .await
         {
@@ -627,7 +622,7 @@ impl CommandProcessor {
                 };
                 
                 format!(
-                    "💰 Fund your wallet:\n\n1️⃣ AIRTIME (USSD)\nDial *384*46750#\n\n2️⃣ VOUCHER\nREDEEM <code>\n\n3️⃣ EXTERNAL WALLET\nDeposit to:\n{}",
+                    "Fund wallet:\nDial *384*46750#\nOr REDEEM <code>\nOr send to:\n{}",
                     deposit_address
                 )
             }
@@ -666,7 +661,7 @@ impl CommandProcessor {
 
         // Call Contract API to redeem voucher on-chain
         let client = reqwest::Client::new();
-        let api_url = "http://localhost:3000/api/redeem";
+        let api_url = &format!("{}/api/redeem", self.backend_url);
         
         tracing::info!("Calling Contract API to redeem voucher: {}", code);
         
@@ -735,7 +730,7 @@ impl CommandProcessor {
 
         // Call Contract API to swap tokens (async - don't wait for completion)
         let client = reqwest::Client::new();
-        let api_url = "http://localhost:3000/api/swap";
+        let api_url = &format!("{}/api/swap", self.backend_url);
         
         tracing::info!("Initiating swap of {} {} for user {}", amount, token, user.wallet_address);
         
@@ -779,7 +774,7 @@ impl CommandProcessor {
         );
 
         let response = client
-            .post("http://localhost:3000/api/bridge")
+            .post(&format!("{}/api/bridge", self.backend_url))
             .json(&serde_json::json!({
                 "fromChain": from_chain.to_lowercase(),
                 "toChain": to_chain.to_lowercase(),
@@ -799,7 +794,7 @@ impl CommandProcessor {
                     if result["success"].as_bool().unwrap_or(false) {
                         let route = result["route"].as_str().unwrap_or("");
                         format!(
-                            "🌉 Bridge initiated!\n\n{}\n\nYou'll get an SMS when complete.\nThis may take a few minutes.",
+                            "Bridge started!\n{}\nSMS when done.",
                             route
                         )
                     } else {
@@ -867,10 +862,10 @@ impl CommandProcessor {
 
     fn unknown_response(&self, text: &str) -> String {
         if text.is_empty() {
-            "Welcome to TextChain!\n\nReply HELP for commands.".to_string()
+            "Welcome to TextChain!\n\nReply COMMANDS for help.".to_string()
         } else {
             format!(
-                "Unknown: {}\n\nReply HELP for commands.",
+                "Unknown: {}\n\nReply COMMANDS for help.",
                 text.chars().take(15).collect::<String>()
             )
         }
@@ -899,8 +894,8 @@ mod tests {
     #[test]
     fn test_parse_help() {
         let processor = test_processor();
-        assert_eq!(processor.parse("HELP"), Command::Help);
-        assert_eq!(processor.parse("help"), Command::Help);
+        assert_eq!(processor.parse("COMMANDS"), Command::Help);
+        assert_eq!(processor.parse("menu"), Command::Help);
         assert_eq!(processor.parse("?"), Command::Help);
     }
 

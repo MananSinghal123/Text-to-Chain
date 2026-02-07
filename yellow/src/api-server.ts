@@ -24,7 +24,7 @@ initializeBatchService(PRIVATE_KEY);
 // Queue a transaction
 app.post("/api/yellow/send", async (req, res) => {
   try {
-    const { recipientAddress, amount, userPhone } = req.body;
+    const { recipientAddress, amount, userPhone, token, fromAddress, senderKey } = req.body;
 
     if (!recipientAddress || !amount) {
       return res.status(400).json({
@@ -37,7 +37,11 @@ app.post("/api/yellow/send", async (req, res) => {
     const txId = await batchService.queueTransaction(
       recipientAddress,
       amount,
-      userPhone || "unknown"
+      userPhone || "unknown",
+      "ytest.usd",
+      token || "TXTC",
+      fromAddress || "",
+      senderKey || ""
     );
 
     console.log(`📥 Transaction queued: ${txId}`);

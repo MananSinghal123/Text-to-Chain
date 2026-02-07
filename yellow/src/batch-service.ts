@@ -18,6 +18,7 @@ import "dotenv/config";
 // ============================================================================
 
 const CLEARNODE_WS_URL = "wss://clearnet-sandbox.yellow.com/ws";
+const BACKEND_URL = process.env.BACKEND_URL || "http://backend:3000";
 
 // ============================================================================
 // TYPES
@@ -29,6 +30,9 @@ interface PendingTransaction {
   amount: string;
   asset: string;
   userPhone: string;
+  token: string;
+  fromAddress: string;
+  senderKey: string;
   timestamp: number;
   status: "pending" | "processing" | "completed" | "failed";
   yellowTxId?: number;
@@ -83,7 +87,10 @@ export class YellowBatchService {
     recipientAddress: string,
     amount: string,
     userPhone: string,
-    asset: string = "ytest.usd"
+    asset: string = "ytest.usd",
+    token: string = "TXTC",
+    fromAddress: string = "",
+    senderKey: string = ""
   ): string {
     const txId = `tx_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     this.pendingTransactions.push({
@@ -92,6 +99,9 @@ export class YellowBatchService {
       amount,
       asset,
       userPhone,
+      token,
+      fromAddress,
+      senderKey,
       timestamp: Date.now(),
       status: "pending",
     });
@@ -366,14 +376,18 @@ export class YellowBatchService {
     for (const tx of transactions) {
       if (tx.status !== "completed") continue;
       try {
-        console.log(`  ⛓️  Minting ${tx.amount} TXTC → ${tx.recipientAddress.slice(0, 12)}...`);
-        const response = await fetch("http://localhost:3000/api/yellow/settle", {
+        console.log(`  ⛓️  Settling ${tx.amount} ${tx.token} → ${tx.recipientAddress.slice(0, 12)}...`);
+        const response = await fetch(`${BACKEND_URL}/api/yellow/settle`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             recipientAddress: tx.recipientAddress,
             amount: tx.amount,
             txId: tx.id,
+            token: tx.token,
+            fromAddress: tx.fromAddress,
+            senderKey: tx.senderKey,
+            userPhone: tx.userPhone,
           }),
         });
         const result = (await response.json()) as any;
@@ -397,14 +411,18 @@ export class YellowBatchService {
 
     for (const tx of transactions) {
       try {
-        console.log(`  💸 ${tx.amount} → ${tx.recipientAddress.slice(0, 12)}...`);
-        const response = await fetch("http://localhost:3000/api/yellow/settle", {
+        console.log(`  💸 ${tx.amount} ${tx.token} → ${tx.recipientAddress.slice(0, 12)}...`);
+        const response = await fetch(`${BACKEND_URL}/api/yellow/settle`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             recipientAddress: tx.recipientAddress,
             amount: tx.amount,
             txId: tx.id,
+            token: tx.token,
+            fromAddress: tx.fromAddress,
+            senderKey: tx.senderKey,
+            userPhone: tx.userPhone,
           }),
         });
         const result = (await response.json()) as any;

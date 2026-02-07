@@ -18,6 +18,7 @@ An SMS-based DeFi platform enabling users to interact with blockchain technology
 | `REDEEM <code>` | Redeem voucher for tokens | `REDEEM ABC123` |
 | `SEND <amt> <token> TO <recipient>` | Send tokens (batched via Yellow Network) | `SEND 10 TXTC TO alice.ttcip.eth` |
 | `SWAP <amt> TXTC` | Swap TXTC for ETH (Uniswap V3) | `SWAP 5 TXTC` |
+| `CASHOUT <amt> TXTC` | Convert TXTC → USDC on Arc via CCTP | `CASHOUT 10 TXTC` |
 | `BRIDGE <amt> <token> FROM <chain> TO <chain>` | Cross-chain bridge (Li.Fi, mainnet) | `BRIDGE 10 USDC FROM POLYGON TO BASE` |
 | `SAVE <name> <phone>` | Save a contact | `SAVE alice +919876543210` |
 | `CONTACTS` | List saved contacts | `CONTACTS` |
@@ -32,40 +33,89 @@ An SMS-based DeFi platform enabling users to interact with blockchain technology
 ```
 ┌──────────────────────────────────────────────────────────────────┐
 │                         USER LAYER                               │
-│  Feature Phone ──► SMS ──► Twilio/SMSCountry ──► Webhook        │
+│  Feature Phone ──► SMS ──► Twilio ──► Cloudflare Tunnel          │
 └──────────────────────────────────────────────────────────────────┘
                               │
                               ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │                  SMS REQUEST HANDLER (Rust, Port 8080)           │
-│  • Command Parser (parser.rs)                                    │
-│  • User Auth (phone → wallet)                                    │
-│  • SQLite DB (users, vouchers, contacts)                         │
-│  • Routes to backend APIs                                        │
+│  • Command Parser (JOIN, BALANCE, SEND, SWAP, CASHOUT, etc.)    │
+│  • User Auth (phone → wallet mapping in SQLite)                  │
+│  • Routes to backend microservices                               │
 └──────────────────────────────────────────────────────────────────┘
-          │                    │                    │
-          ▼                    ▼                    ▼
-┌──────────────┐   ┌──────────────────┐   ┌──────────────────┐
-│ Backend API  │   │  Yellow Network  │   │   Li.Fi Bridge   │
-│ (Port 3000)  │   │  (Port 8083)     │   │  (via Backend)   │
-│              │   │                  │   │                  │
-│ • Swap       │   │ • Batch SEND     │   │ • Cross-chain    │
-│ • Redeem     │   │ • 3-min sessions │   │ • Quote/Execute  │
-│ • Balance    │   │ • Off-chain xfer │   │ • Mainnet only   │
-│ • ENS        │   │ • On-chain settle│   │ • USDC/USDT/ETH  │
-│ • Deposit    │   │ • Nitrolite SDK  │   │                  │
-└──────┬───────┘   └────────┬─────────┘   └──────────────────┘
-       │                    │
-       ▼                    ▼
-┌──────────────────────────────────────────────────────────────────┐
-│                   SMART CONTRACTS (Sepolia Testnet)               │
-│                                                                  │
-│  TokenXYZ (TXTC)     0x0F0E4A3F59C3B8794A9044a0dC0155fB3C3fA223 │
-│  VoucherManager      0x74B02854a16cf33416541625C100beC97cC94F01  │
-│  EntryPointV3        0x0084FA06Fa317D4311d865f35d62dCBcb0517355  │
-│  Uniswap V3 Pool     0xfdbf742dfc37b7ed1da429d3d7add78d99026c23  │
-│  ENS Registrar       0xcD057A8AbF3832e65edF5d224313c6b4e6324F76  │
-└──────────────────────────────────────────────────────────────────┘
+       │              │              │              │
+       ▼              ▼              ▼              ▼
+┌────────────┐ ┌────────────┐ ┌────────────┐ ┌─────────────────┐
+│ Backend    │ │ Yellow     │ │ Arc/CCTP   │ │ Li.Fi Bridge    │
+│ API :3000  │ │ Batch :8083│ │ Service    │ │ (via Backend)   │
+│            │ │            │ │ :8084      │ │                 │
+│ • Redeem   │ │ • Batch    │ │ • CASHOUT  │ │ • Cross-chain   │
+│ • Balance  │ │   SEND     │ │ • Circle   │ │ • Multi-chain   │
+│ • Swap     │ │ • Nitrolite│ │   Wallets  │ │ • Quote/Execute │
+│ • ENS      │ │ • Off-chain│ │ • CCTP     │ │                 │
+│ • Notify   │ │ • Settle   │ │   Bridge   │ │                 │
+└─────┬──────┘ └─────┬──────┘ └──┬───┬─────┘ └─────────────────┘
+      │              │           │   │
+      ▼              ▼           │   │
+┌─────────────────────────────┐  │   │
+│  SEPOLIA TESTNET            │  │   │
+│                             │  │   │
+│  TXTC Token    0x0F0E...223 │  │   │
+│  VoucherMgr    0x74B0...F01 │  │   │
+│  Uniswap V3   0xfdbf...c23 │  │   │
+│  WETH          0xfFf9...B14 │  │   │
+│  USDC          0x1c7d...238 │  │   │
+│  ENS Registrar 0xcD05...F76 │  │   │
+│  TokenMessengerV2 (CCTP)    │◄─┘   │
+└─────────────────────────────┘      │
+              │ CCTP depositForBurn   │
+              ▼                       │
+┌─────────────────────────────┐      │
+│  CIRCLE ATTESTATION SERVICE │      │
+│  (Iris API Sandbox)         │      │
+│  • Fast Transfer (~20s)     │      │
+│  • Attestation signing      │      │
+└─────────────┬───────────────┘      │
+              │ attestation           │
+              ▼                       │
+┌─────────────────────────────┐      │
+│  ARC TESTNET                │◄─────┘
+│                             │  receiveMessage (mint)
+│  USDC (native)   0x3600..  │
+│  MessageTransmitterV2      │
+│  Circle Wallets (per user) │
+│  Batch Payouts             │
+└─────────────────────────────┘
+```
+
+### CASHOUT Flow (TXTC → USDC on Arc)
+
+```
+User SMS: "CASHOUT 10 TXTC"
+    │
+    ▼
+1. Burn 10 TXTC from user's Sepolia wallet
+    │
+    ▼
+2. Swap TXTC → WETH (Uniswap V3, 0.3% pool)
+    │
+    ▼
+3. Swap WETH → USDC (Uniswap V3, 0.05% pool)
+    │
+    ▼
+4. Approve USDC → TokenMessengerV2
+    │
+    ▼
+5. depositForBurn (CCTP) → Sepolia → Arc (domain 0 → 26)
+    │
+    ▼
+6. Poll Circle Iris API for attestation (~20s Fast Transfer)
+    │
+    ▼
+7. receiveMessage on Arc → USDC minted to user's Circle Wallet
+    │
+    ▼
+8. SMS notification: "✅ Cashout complete! 10 TXTC → ~$240 USDC"
 ```
 
 ---
@@ -131,6 +181,22 @@ An SMS-based DeFi platform enabling users to interact with blockchain technology
 - 90% TXTC + 10% ETH distribution
 - Africa's Talking payment gateway integration
 
+### 10. CASHOUT — USDC on Arc via Circle CCTP (Bounty Track)
+- `CASHOUT <amount> TXTC` → converts TXTC to USDC on Arc Testnet
+- **Full on-chain flow:** Burn TXTC from user → Swap TXTC→WETH → Swap WETH→USDC (Uniswap V3) → CCTP bridge to Arc
+- **Circle CCTP V2** with Fast Transfer (~20 second attestation)
+- **Circle Developer-Controlled Wallets** — one per user, mapped by phone number
+- **Persistent wallet storage** — survives container restarts (file-backed + Docker volume)
+- **Multi-recipient batch payouts** — `POST /api/arc/batch-payout` sends USDC to multiple Arc wallets
+- **Treasury dashboard API** — `GET /api/arc/treasury` returns aggregate balances and payout stats
+- **SMS notification** on cashout completion via Twilio
+- **Contract addresses:**
+  - Sepolia TokenMessengerV2: `0x8fe6b999dc680ccfdd5bf7eb0974218be2542daa`
+  - Arc MessageTransmitterV2: `0xe737e5cebeeba77efe34d4aa090756590b1ce275`
+  - Sepolia USDC: `0x1c7d4b196cb0c7b01d743fbc6116a902379c7238`
+  - Arc USDC (native): `0x3600000000000000000000000000000000000000`
+- **Circle tools used:** Arc, USDC, Circle Wallets, CCTP
+
 ---
 
 ## 📂 Repository Structure
@@ -143,8 +209,15 @@ Text-to-Chain/
 │   ├── src/db/              # SQLite (users, vouchers, contacts, deposits)
 │   └── src/wallet/          # Wallet creation, chains, tokens
 │
+├── arc-service/             # Arc/Circle CCTP Cashout Service (Port 8084)
+│   ├── src/index.ts         # Express API (cashout, wallet, pay, batch-payout, treasury)
+│   ├── src/cashout-service.ts # TXTC→WETH→USDC swap + CCTP bridge logic
+│   ├── src/circle-wallet.ts # Circle Developer-Controlled Wallets SDK
+│   ├── wallets.json         # Persistent phone→wallet mapping
+│   └── Dockerfile
+│
 ├── backend-integration/     # TypeScript API server (Port 3000)
-│   ├── api-server.ts        # Express endpoints (swap, redeem, balance, bridge, ENS)
+│   ├── api-server.ts        # Express endpoints (swap, redeem, balance, bridge, ENS, notify)
 │   ├── contract-service.ts  # Smart contract interactions
 │   ├── lifi-service.ts      # Li.Fi bridge/swap service + chain/token maps
 │   ├── ens-service.ts       # ENS subdomain registration
@@ -189,12 +262,15 @@ Text-to-Chain/
 |-------|-----------|
 | **SMS Handler** | Rust, Axum, SQLite, reqwest |
 | **Backend API** | TypeScript, Express, ethers.js v6 |
+| **Arc/CCTP Service** | TypeScript, Circle SDK, CCTP V2, Circle Wallets |
 | **Yellow Network** | Nitrolite SDK, WebSocket, state channels |
-| **Cross-Chain** | Li.Fi SDK/API |
+| **Cross-Chain** | Li.Fi SDK/API, Circle CCTP |
 | **Smart Contracts** | Solidity ^0.8.20, Foundry |
-| **Blockchain** | Ethereum Sepolia (testnet) |
-| **SMS Gateway** | Twilio, SMSCountry |
-| **RPC Provider** | Alchemy |
+| **Blockchains** | Ethereum Sepolia + Arc Testnet |
+| **Circle Tools** | Arc, USDC, CCTP V2, Developer-Controlled Wallets |
+| **SMS Gateway** | Twilio |
+| **Infrastructure** | Docker Compose, Cloudflare Tunnel |
+| **RPC Providers** | Alchemy (Sepolia), dRPC (Arc) |
 
 ---
 
@@ -202,21 +278,28 @@ Text-to-Chain/
 
 ### Prerequisites
 
-- Rust (latest stable)
-- Node.js v18+
-- Foundry (`foundryup`)
+- Docker & Docker Compose
+- Rust (latest stable) — for local SMS handler dev
+- Node.js v18+ — for local backend dev
 
 ### Environment Variables
 
 **`backend-integration/.env`:**
 ```env
-PRIVATE_KEY=0x...
+PRIVATE_KEY=0x...              # Backend wallet (Sepolia)
 ENS_PRIVATE_KEY=0x...
-RPC_URL=https://eth-sepolia.g.alchemy.com/v2/YOUR_KEY
+ALCHEMY_RPC_URL=https://eth-sepolia.g.alchemy.com/v2/YOUR_KEY
 TWILIO_ACCOUNT_SID=...
 TWILIO_AUTH_TOKEN=...
 TWILIO_PHONE_NUMBER=...
-LIFI_API_KEY=...              # Optional
+```
+
+**`arc-service/.env`:**
+```env
+PRIVATE_KEY=0x...              # Same backend wallet
+ALCHEMY_RPC_URL=https://eth-sepolia.g.alchemy.com/v2/YOUR_KEY
+CIRCLE_API_KEY=...             # Circle Developer Console
+CIRCLE_ENTITY_SECRET=...       # Circle entity secret
 ```
 
 **`yellow/.env`:**
@@ -226,42 +309,42 @@ ALCHEMY_RPC_URL=https://eth-sepolia.g.alchemy.com/v2/YOUR_KEY
 PORT=8083
 ```
 
-### Start Services
+### Start All Services (Docker Compose)
 
 ```bash
-# 1. Backend API (Port 3000)
-cd backend-integration && npm install && npm start
+# Start everything
+docker compose up -d
 
-# 2. Yellow Network Batch Service (Port 8083)
-cd yellow && npm install && npm run dev
-
-# 3. SMS Handler (Port 8080)
-cd sms-request-handler && cargo run
-
-# 4. Expose for Twilio (optional)
-ngrok http 8080
+# Services started:
+#   sms-handler  :8080  — Rust SMS webhook
+#   backend      :3000  — Contract API
+#   yellow       :8083  — Yellow Network batch
+#   arc          :8084  — Arc/CCTP cashout
+#   tunnel-sms          — Cloudflare tunnel for Twilio
 ```
 
 ### Test Commands
 
 ```bash
+# Test CASHOUT (TXTC → USDC on Arc)
+curl -X POST http://localhost:8084/api/arc/cashout \
+  -H "Content-Type: application/json" \
+  -d '{"phone":"+919876543210","userAddress":"0x...","txtcAmount":"10"}'
+
+# Check Arc treasury
+curl http://localhost:8084/api/arc/treasury
+
+# Batch payout (multi-recipient USDC on Arc)
+curl -X POST http://localhost:8084/api/arc/batch-payout \
+  -H "Content-Type: application/json" \
+  -d '{"fromPhone":"+919876543210","recipients":[{"phone":"+919999999999","amount":"5"},{"phone":"+918888888888","amount":"10"}]}'
+
 # Test SMS webhook
-curl -X POST http://localhost:8080/webhook/sms \
-  -H "Content-Type: application/json" \
-  -d '{"From": "+919876543210", "Body": "HELP"}'
+curl -X POST http://localhost:8080/sms/incoming \
+  -d 'From=%2B919876543210&Body=HELP&To=%2B12316743830'
 
-# Test LiFi quote
-curl -X POST http://localhost:3000/api/lifi/quote \
-  -H "Content-Type: application/json" \
-  -d '{"fromChain":"polygon","toChain":"base","fromToken":"USDC","toToken":"USDC","amount":"10","userAddress":"0x..."}'
-
-# Test Yellow send queue
-curl -X POST http://localhost:8083/api/yellow/send \
-  -H "Content-Type: application/json" \
-  -d '{"recipientAddress":"0x...","amount":"10","userPhone":"+919876543210"}'
-
-# Check supported chains
-curl http://localhost:3000/api/lifi/chains
+# Check balance
+curl http://localhost:3000/api/balance/0x...
 ```
 
 ---
